@@ -295,10 +295,12 @@ def is_chat_org(org: dict) -> bool:
 
 
 def org_label(name: str, plan: str) -> str:
-    """Nom d'affichage : raccourcit l'org perso Anthropic trop verbeuse."""
+    """Nom d'affichage : raccourcit l'org perso, et porte toujours le plan à côté."""
     if "'s Organization" in name or "’s Organization" in name or "'s Individual Org" in name:
-        return f"Perso · {plan}" if plan else "Perso"
-    return name or plan or "Organisation"
+        short = "Perso"
+    else:
+        short = name or "Organisation"
+    return f"{short} · {plan}" if plan else short
 
 
 def _memberships(account: dict | None, active_id: str, email: str, account_name: str) -> list[tuple[str, str, str]]:

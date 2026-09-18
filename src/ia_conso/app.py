@@ -50,7 +50,7 @@ from . import help as manual
 from .anthropic import fetch, org_label
 from .avatars import Avatars
 from .config import CONFIG_PATH, Config
-from .formatting import ago, countdown, extra_reset_line, money, percent, reset_line, tint_for
+from .formatting import age_seconds, countdown, freshness_label, freshness_tint, money, percent, reset_bits, tint_for
 from .models import Extra, OrgView, Snapshot, Window, now
 from .state import acquire_single_instance, log_error, write_status
 
@@ -124,10 +124,11 @@ def _percent_field(value: float | None) -> str:
     return percent(value).rjust(PERCENT_FIELD, PERCENT_PAD)
 
 
-def _meter_title(label: str, value: float | None, detail: str, reset: str):
-    """Bloc commun : libellé + reset, puis « N %  ████ », puis détail éventuel."""
+def _meter_title(label: str, value: float | None, detail: str, reset: str = "", when: str = ""):
+    """Bloc commun : libellé + reset, puis « N %  ████ » teintés comme l'icône."""
     tint = _colour(tint_for(value))
     grey = NSColor.secondaryLabelColor()
+    identity = _colour(IDENTITY_TINT)
     text = NSMutableAttributedString.alloc().init()
     text.appendAttributedString_(
         _run(label.upper(), HEADER_FONT, color=tint, weight=NSFontWeightSemibold, paragraph=_paragraph())
@@ -136,7 +137,10 @@ def _meter_title(label: str, value: float | None, detail: str, reset: str):
         text.appendAttributedString_(
             _run(f"  ·  {reset}", META_FONT, color=grey, weight=NSFontWeightMedium)
         )
-    # Chiffre et jauge sur la même ligne, chacun dans une zone de largeur fixe.
+    if when:
+        text.appendAttributedString_(
+            _run(f" · {when}", META_FONT, color=identity, weight=NSFontWeightSemibold)
+        )
     text.appendAttributedString_(
         _run(
             f"\n{_percent_field(value)}",
@@ -160,13 +164,20 @@ def _meter_title(label: str, value: float | None, detail: str, reset: str):
         )
     if detail:
         text.appendAttributedString_(
-            _run(f"\n{detail}", META_FONT, color=grey, weight=NSFontWeightMedium, paragraph=_paragraph(before=1.0))
+            _run(
+                f"  ·  {detail}",
+                META_FONT,
+                color=grey,
+                weight=NSFontWeightMedium,
+                baseline=BAR_BASELINE,
+            )
         )
     return text
 
 
 def _window_title(window: Window):
-    return _meter_title(window.label, window.percent, "", reset_line(window))
+    reset, when = reset_bits(window.resets_at, is_session=window.is_session)
+    return _meter_title(window.label, window.percent, "", reset, when)
 
 
 def _extra_title(extra: Extra):
@@ -180,18 +191,28 @@ def _extra_title(extra: Extra):
     value = extra.percent if extra.percent is not None else (
         (100.0 * extra.used / extra.cap) if extra.cap else 0.0
     )
-    return _meter_title("extra", value, detail, extra_reset_line(extra))
+    reset, when = (("reset mensuel", "") if extra.resets_at is None else reset_bits(extra.resets_at))
+    return _meter_title("extra", value, detail, reset, when)
 
 
 def _account_header(org: OrgView):
     grey = NSColor.secondaryLabelColor()
     title = org_label(org.org_name, org.plan)
-    status = "actif" if org.is_active else "inactif"
-    meta = " · ".join(p for p in (org.email, org.plan, status) if p)
-    if org.fetched_at:
-        meta = f"{meta} · lu {ago(org.fetched_at)}" if meta else f"lu {ago(org.fetched_at)}"
+    # Le plan est déjà dans le titre : en dessous, seulement l'email.
+    meta = org.email or ""
+    freshness = freshness_label(org.is_active, org.fetched_at)
+    if org.is_active:
+        name_tint = _colour(IDENTITY_TINT)
+        age_tint = _colour(freshness_tint(age_seconds(org.fetched_at)))
+    else:
+        name_tint = grey
+        age_tint = grey
     text = NSMutableAttributedString.alloc().init()
-    text.appendAttributedString_(_run(title, TITLE_FONT, weight=NSFontWeightSemibold, paragraph=_paragraph()))
+    text.appendAttributedString_(
+        _run(title, TITLE_FONT, color=name_tint, weight=NSFontWeightSemibold, paragraph=_paragraph())
+    )
+    text.appendAttributedString_(_run("  ·  ", TITLE_FONT, color=grey, weight=NSFontWeightSemibold))
+    text.appendAttributedString_(_run(freshness, TITLE_FONT, color=age_tint, weight=NSFontWeightMedium))
     if meta:
         text.appendAttributedString_(
             _run(f"\n{meta}", META_FONT, color=grey, paragraph=_paragraph(before=1.0))
@@ -201,23 +222,33 @@ def _account_header(org: OrgView):
 
 def _org_summary(org: OrgView):
     grey = NSColor.secondaryLabelColor()
-    tint = _colour(tint_for(org.session.percent if org.session else None))
     title = org_label(org.org_name, org.plan)
+    freshness = freshness_label(org.is_active, org.fetched_at)
+    name_tint = None if org.is_active else grey
+    age_tint = (
+        _colour(freshness_tint(age_seconds(org.fetched_at))) if org.is_active else grey
+    )
     text = NSMutableAttributedString.alloc().init()
-    text.appendAttributedString_(_run(title, TITLE_FONT, weight=NSFontWeightSemibold, paragraph=_paragraph()))
-    parts = []
+    text.appendAttributedString_(
+        _run(title, TITLE_FONT, color=name_tint, weight=NSFontWeightSemibold, paragraph=_paragraph())
+    )
+    text.appendAttributedString_(_run("  ·  ", TITLE_FONT, color=grey, weight=NSFontWeightSemibold))
+    text.appendAttributedString_(_run(freshness, TITLE_FONT, color=age_tint, weight=NSFontWeightMedium))
+    bits = []
     if org.session:
-        parts.append(f"session {percent(org.session.percent)}")
+        bits.append((f"session {percent(org.session.percent)}", tint_for(org.session.percent)))
     if org.weekly:
-        parts.append(f"semaine {percent(org.weekly.percent)}")
+        bits.append((f"semaine {percent(org.weekly.percent)}", tint_for(org.weekly.percent)))
     if org.extra and org.extra.cap:
-        parts.append(f"extra {percent(org.extra.percent)}")
-    if parts:
-        text.appendAttributedString_(
-            _run("\n" + "  ·  ".join(parts), TITLE_FONT, color=tint, weight=NSFontWeightMedium, paragraph=_paragraph(before=2.0))
-        )
-    age = f"lu {ago(org.fetched_at)}" if org.fetched_at else "pas encore capturé"
-    text.appendAttributedString_(_run(f"\n{age}", META_FONT, color=grey, paragraph=_paragraph(before=1.0)))
+        bits.append((f"extra {percent(org.extra.percent)}", tint_for(org.extra.percent)))
+    if bits:
+        text.appendAttributedString_(_run("\n", TITLE_FONT, paragraph=_paragraph(before=2.0)))
+        for index, (label, bit_tint) in enumerate(bits):
+            if index:
+                text.appendAttributedString_(_run("  ·  ", TITLE_FONT, color=grey, weight=NSFontWeightMedium))
+            text.appendAttributedString_(
+                _run(label, TITLE_FONT, color=_colour(bit_tint), weight=NSFontWeightMedium)
+            )
     return text
 
 
@@ -372,7 +403,6 @@ class IAConsoApp(NSObject):
         self.menu_open = False
         self.shown = None
         self.footer_item = None
-        self.updated_item = None
         self.footer_rows = []
         self.footer_active = []
         self.shortcut_row = None
@@ -659,7 +689,6 @@ class IAConsoApp(NSObject):
         menu.setShowsStateColumn_(False)
         snap = self.snapshot
         self.shown = self.contents()
-        self.updated_item = None
         self.footer_rows, self.footer_active = [], []
         self.shortcut_row = None
 
@@ -695,12 +724,26 @@ class IAConsoApp(NSObject):
     def add_flat_account(self, menu, snap: Snapshot) -> None:
         who = snap.account
         label = org_label(who.org_name, who.plan) if who.org_name else (who.name or who.email)
-        meta = " · ".join(p for p in (who.email, who.plan, "actif") if p)
+        # Le plan est déjà dans le titre.
+        meta = who.email or ""
+        freshness = freshness_label(True, snap.fetched_at)
         header = NSMutableAttributedString.alloc().init()
-        header.appendAttributedString_(_run(label, TITLE_FONT, weight=NSFontWeightSemibold, paragraph=_paragraph()))
         header.appendAttributedString_(
-            _run(f"\n{meta}", META_FONT, color=NSColor.secondaryLabelColor(), paragraph=_paragraph(before=1.0))
+            _run(label, TITLE_FONT, color=_colour(IDENTITY_TINT), weight=NSFontWeightSemibold, paragraph=_paragraph())
         )
+        header.appendAttributedString_(_run("  ·  ", TITLE_FONT, color=NSColor.secondaryLabelColor()))
+        header.appendAttributedString_(
+            _run(
+                freshness,
+                TITLE_FONT,
+                color=_colour(freshness_tint(age_seconds(snap.fetched_at))),
+                weight=NSFontWeightMedium,
+            )
+        )
+        if meta:
+            header.appendAttributedString_(
+                _run(f"\n{meta}", META_FONT, color=NSColor.secondaryLabelColor(), paragraph=_paragraph(before=1.0))
+            )
         self.add_rich(menu, header, image=_face(self.avatars, who.email))
         if snap.error:
             self.add_info(menu, snap.error)
@@ -777,21 +820,6 @@ class IAConsoApp(NSObject):
                 item.setAttributedTitle_(_window_title(value))
             elif kind == "extra":
                 item.setAttributedTitle_(_extra_title(value))
-        if self.updated_item is not None:
-            self.updated_item.setAttributedTitle_(self.updated_title())
-
-    @objc.python_method
-    def updated_line(self) -> str:
-        if self.fetching:
-            return "mise à jour…"
-        if self.snapshot.fetched_at is None:
-            return "pas encore lu"
-        when = self.snapshot.fetched_at.astimezone().strftime("%H:%M:%S")
-        return f"lu {ago(self.snapshot.fetched_at)} · {when}"
-
-    @objc.python_method
-    def updated_title(self):
-        return _run(self.updated_line(), META_FONT, color=NSColor.secondaryLabelColor())
 
     @objc.python_method
     def footer_text(self) -> str:
@@ -819,11 +847,6 @@ class IAConsoApp(NSObject):
 
     @objc.python_method
     def add_footer(self, menu) -> None:
-        self.updated_item = NSMenuItem.alloc().init()
-        self.updated_item.setAttributedTitle_(self.updated_title())
-        self.updated_item.setEnabled_(False)
-        menu.addItem_(self.updated_item)
-
         self.footer_item = self.add_action(menu, "", "refresh:", "r", "arrow.clockwise")
         self.footer_item.setAttributedTitle_(self.refresh_title())
         self.footer_item.setToolTip_("Actualiser maintenant (⌘R)")

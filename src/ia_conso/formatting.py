@@ -2,26 +2,39 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .models import Snapshot, Window
 
+# Même échelle que GitTodo / LinearTodo : deux plus grandes unités qui se suivent.
 UNITS: tuple[tuple[str, int], ...] = (
+    ("an", 365 * 86400),
+    ("mois", 30 * 86400),
+    ("sem", 7 * 86400),
     ("j", 86400),
     ("h", 3600),
     ("min", 60),
     ("s", 1),
 )
+JUST_NOW = 10
+DAY = 86400
+FRESH_OK = 5 * 60
+FRESH_STALE = 3600
 WEEKDAYS = ("lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim.")
+MONTHS = ("janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc.")
 CURRENCY = {"EUR": "€", "USD": "$", "GBP": "£"}
 
 
 def _plural(label: str, count: int) -> str:
-    return f"{count} {label}"
+    return f"{count} {label}s" if label == "an" and count > 1 else f"{count} {label}"
 
 
 def spell(seconds: int) -> str:
-    """Durée dans les deux plus grandes unités qui se suivent : « 3 h 25 min », « 4 j 10 h »."""
+    """Durée dans les deux plus grandes unités, à condition qu'elles se suivent.
+
+    « 3 h 25 min », « 2 mois 1 sem », « 1 an 2 mois ». Si l'unité juste en dessous de la
+    plus grande est nulle, elle n'est pas affichée : 2 ans et 3 jours donne « 2 ans ».
+    """
     seconds = max(0, int(seconds))
     for index, (label, size) in enumerate(UNITS):
         if count := seconds // size:
@@ -31,7 +44,7 @@ def spell(seconds: int) -> str:
                 if extra := (seconds - count * size) // unit:
                     parts.append(_plural(below, extra))
             return " ".join(parts)
-    return "maintenant"
+    return ""
 
 
 def countdown(seconds: int) -> str:
@@ -45,7 +58,10 @@ def remaining(moment: datetime | None, at: datetime | None = None) -> int:
     return max(0, int((moment - current).total_seconds()))
 
 
-JUST_NOW = 10
+def until(moment: datetime, now: datetime | None = None) -> str:
+    """Délai restant avant une échéance (LinearTodo) : « dans 3 h 25 min »."""
+    seconds = int((moment - (now or datetime.now(timezone.utc))).total_seconds())
+    return f"dans {spell(seconds)}" if seconds > 0 else "maintenant"
 
 
 def ago(moment: datetime | None, at: datetime | None = None) -> str:
@@ -55,38 +71,99 @@ def ago(moment: datetime | None, at: datetime | None = None) -> str:
     return "à l'instant" if seconds < JUST_NOW else f"il y a {spell(seconds)}"
 
 
-def clock(moment: datetime | None) -> str:
-    """Heure locale du reset, avec le jour si ce n'est pas aujourd'hui."""
+def age_seconds(moment: datetime | None, at: datetime | None = None) -> int | None:
+    if moment is None:
+        return None
+    return max(0, int(((at or datetime.now(timezone.utc)) - moment).total_seconds()))
+
+
+def freshness_tint(seconds: int | None) -> str:
+    """Vert < 5 min, jaune jusqu'à 1 h, rouge au-delà (ou jamais lu)."""
+    if seconds is None:
+        return "systemRedColor"
+    if seconds < FRESH_OK:
+        return "systemGreenColor"
+    if seconds < FRESH_STALE:
+        return "systemYellowColor"
+    return "systemRedColor"
+
+
+def since_read(moment: datetime | None, at: datetime | None = None) -> str:
+    """Âge de la dernière lecture : « depuis 3 min », « à l'instant », « pas encore lu »."""
+    seconds = age_seconds(moment, at)
+    if seconds is None:
+        return "pas encore lu"
+    if seconds < JUST_NOW:
+        return "à l'instant"
+    return f"depuis {spell(seconds)}"
+
+
+def freshness_label(is_active: bool, moment: datetime | None, at: datetime | None = None) -> str:
+    """« actif depuis 3 min » / « inactif · pas encore lu »."""
+    status = "actif" if is_active else "inactif"
+    age = since_read(moment, at)
+    if age.startswith("depuis "):
+        return f"{status} {age}"
+    if age == "à l'instant":
+        return f"{status} à l'instant"
+    return f"{status} · {age}"
+
+
+def _date(local: datetime, today) -> str:
+    month = MONTHS[local.month - 1]
+    day = f"{WEEKDAYS[local.weekday()]} {local.day} {month}"
+    if local.year != today.year:
+        return f"{day} {local.year}"
+    return day
+
+
+def pinpoint(moment: datetime | None, at: datetime | None = None) -> str:
+    """Horodatage absolu du reset, calibré sur la distance.
+
+    - moins de 24 h, aujourd'hui : « 18:20 »
+    - moins de 24 h, demain : « sam. 02:00 »
+    - au-delà : « lun. 21 sept. 04:00 » (année si besoin)
+    """
     if moment is None:
         return ""
+    current = (at or datetime.now(timezone.utc)).astimezone()
     local = moment.astimezone()
-    today = datetime.now().astimezone().date()
+    left = (local - current).total_seconds()
+    today = current.date()
+    tomorrow = today + timedelta(days=1)
     hour = local.strftime("%H:%M")
-    if local.date() == today:
-        return hour
-    return f"{WEEKDAYS[local.weekday()]} {hour}"
+
+    if 0 <= left < DAY:
+        if local.date() == today:
+            return hour
+        if local.date() == tomorrow:
+            return f"{WEEKDAYS[local.weekday()]} {hour}"
+        return f"{_date(local, today)} {hour}"
+
+    return f"{_date(local, today)} {hour}"
+
+
+def reset_bits(resets_at: datetime | None, *, is_session: bool = False, at: datetime | None = None) -> tuple[str, str]:
+    """(libellé gris, horodatage à mettre en évidence) pour une ligne de reset."""
+    if resets_at is None:
+        return ("pas encore commencée" if is_session else "reset inconnu", "")
+    left = remaining(resets_at, at)
+    when = pinpoint(resets_at, at)
+    if left <= 0:
+        return ("reset imminent", when)
+    return (f"reset {until(resets_at, at)}", when)
 
 
 def reset_line(window: Window, at: datetime | None = None) -> str:
-    if window.resets_at is None:
-        return "pas encore commencée" if window.is_session else "reset inconnu"
-    left = remaining(window.resets_at, at)
-    when = clock(window.resets_at)
-    wait = countdown(left)
-    if left <= 0:
-        return "reset imminent"
-    return f"reset dans {wait}" + (f" · {when}" if when else "")
+    text, when = reset_bits(window.resets_at, is_session=window.is_session, at=at)
+    return f"{text} · {when}" if when else text
 
 
 def extra_reset_line(extra, at: datetime | None = None) -> str:
     if extra.resets_at is None:
         return "reset mensuel"
-    left = remaining(extra.resets_at, at)
-    when = clock(extra.resets_at)
-    wait = countdown(left)
-    if left <= 0:
-        return "reset imminent"
-    return f"reset dans {wait}" + (f" · {when}" if when else "")
+    text, when = reset_bits(extra.resets_at, at=at)
+    return f"{text} · {when}" if when else text
 
 
 def percent(value: float | None) -> str:
