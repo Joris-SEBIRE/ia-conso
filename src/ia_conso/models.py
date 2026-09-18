@@ -63,6 +63,20 @@ class OrgView:
 
 
 @dataclass(frozen=True)
+class CursorView:
+    """Compte Cursor connecté localement (token dans state.vscdb)."""
+
+    email: str
+    plan: str
+    period: Window | None = None
+    used: float = 0.0
+    cap: float = 0.0
+    currency: str = "USD"
+    fetched_at: datetime | None = None
+    error: str = ""
+
+
+@dataclass(frozen=True)
 class Snapshot:
     account: Account | None = None
     session: Window | None = None
@@ -71,6 +85,7 @@ class Snapshot:
     extra: Extra | None = None
     breakdown: tuple[tuple[str, float], ...] = ()
     orgs: tuple[OrgView, ...] = ()
+    cursor: CursorView | None = None
     fetched_at: datetime | None = None
     error: str = ""
     token_origin: str = ""

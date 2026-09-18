@@ -50,8 +50,9 @@ from . import help as manual
 from .anthropic import fetch, org_label
 from .avatars import Avatars
 from .config import CONFIG_PATH, Config
+from .cursor import fetch_cursor
 from .formatting import age_seconds, countdown, freshness_label, freshness_tint, money, percent, reset_bits, tint_for
-from .models import Extra, OrgView, Snapshot, Window, now
+from .models import CursorView, Extra, OrgView, Snapshot, Window, now
 from .state import acquire_single_instance, log_error, write_status
 
 BUNDLE_ID = "fr.jsebire.ia-conso"
@@ -193,6 +194,34 @@ def _extra_title(extra: Extra):
     )
     reset, when = (("reset mensuel", "") if extra.resets_at is None else reset_bits(extra.resets_at))
     return _meter_title("extra", value, detail, reset, when)
+
+
+def _cursor_header(view: CursorView):
+    grey = NSColor.secondaryLabelColor()
+    title = view.plan or "Cursor"
+    freshness = freshness_label(True, view.fetched_at)
+    age_tint = _colour(freshness_tint(age_seconds(view.fetched_at)))
+    text = NSMutableAttributedString.alloc().init()
+    text.appendAttributedString_(
+        _run(title, TITLE_FONT, color=_colour(IDENTITY_TINT), weight=NSFontWeightSemibold, paragraph=_paragraph())
+    )
+    text.appendAttributedString_(_run("  ·  ", TITLE_FONT, color=grey, weight=NSFontWeightSemibold))
+    text.appendAttributedString_(_run(freshness, TITLE_FONT, color=age_tint, weight=NSFontWeightMedium))
+    if view.email:
+        text.appendAttributedString_(
+            _run(f"\n{view.email}", META_FONT, color=grey, paragraph=_paragraph(before=1.0))
+        )
+    return text
+
+
+def _cursor_period_title(view: CursorView):
+    if view.period is None:
+        return None
+    detail = ""
+    if view.cap:
+        detail = f"{money(view.used, view.currency)} / {money(view.cap, view.currency)}"
+    reset, when = reset_bits(view.period.resets_at)
+    return _meter_title(view.period.label, view.period.percent, detail, reset, when)
 
 
 def _account_header(org: OrgView):
@@ -535,9 +564,26 @@ class IAConsoApp(NSObject):
         self.fetch_local.epoch = epoch
         try:
             snapshot = fetch()
+            cursor = fetch_cursor()
+            snapshot = Snapshot(
+                account=snapshot.account,
+                session=snapshot.session,
+                weekly=snapshot.weekly,
+                scoped=snapshot.scoped,
+                extra=snapshot.extra,
+                breakdown=snapshot.breakdown,
+                orgs=snapshot.orgs,
+                cursor=cursor,
+                fetched_at=snapshot.fetched_at,
+                error=snapshot.error,
+                token_origin=snapshot.token_origin,
+                retry_after=snapshot.retry_after,
+            )
             emails = {org.email for org in snapshot.orgs if org.email}
             if snapshot.account and snapshot.account.email:
                 emails.add(snapshot.account.email)
+            if cursor and cursor.email:
+                emails.add(cursor.email)
             self.avatars.prefetch(emails)
             self.land(self.apply_snapshot, snapshot)
         except Exception as exc:
@@ -570,6 +616,7 @@ class IAConsoApp(NSObject):
                 extra=self.snapshot.extra,
                 breakdown=self.snapshot.breakdown,
                 orgs=snapshot.orgs or self.snapshot.orgs,
+                cursor=snapshot.cursor if snapshot.cursor is not None else self.snapshot.cursor,
                 fetched_at=self.snapshot.fetched_at,
                 error=snapshot.error,
                 token_origin=snapshot.token_origin or self.snapshot.token_origin,
@@ -679,6 +726,7 @@ class IAConsoApp(NSObject):
             snap.extra,
             snap.breakdown,
             snap.orgs,
+            snap.cursor,
             snap.error,
             launchagent.is_enabled(),
         )
@@ -701,11 +749,15 @@ class IAConsoApp(NSObject):
         detailed_other = others[:1]
         summarized = others[1:]
 
+        # Actifs d'abord : Claude branché, puis Cursor ; les inactifs Claude en dessous.
         if active:
             self.add_org(menu, active)
         elif snap.account:
-            # Pas encore d'orgs listées : repli sur le snapshot plat.
             self.add_flat_account(menu, snap)
+
+        if snap.cursor is not None:
+            menu.addItem_(NSMenuItem.separatorItem())
+            self.add_cursor(menu, snap.cursor)
 
         if detailed_other:
             menu.addItem_(NSMenuItem.separatorItem())
@@ -777,6 +829,22 @@ class IAConsoApp(NSObject):
             self.add_info(menu, "passe sur ce compte une fois pour capturer la conso")
 
     @objc.python_method
+    def add_cursor(self, menu, view: CursorView) -> None:
+        self.add_rich(menu, _cursor_header(view), image=_face(self.avatars, view.email))
+        if view.error and view.period is None:
+            self.add_info(menu, view.error)
+            return
+        title = _cursor_period_title(view)
+        if title is not None:
+            row = NSMenuItem.alloc().init()
+            row.setAttributedTitle_(title)
+            row.setEnabled_(False)
+            row.setRepresentedObject_(("cursor", view))
+            menu.addItem_(row)
+        elif view.error:
+            self.add_info(menu, view.error)
+
+    @objc.python_method
     def add_window(self, menu, window: Window) -> None:
         row = NSMenuItem.alloc().init()
         row.setAttributedTitle_(_window_title(window))
@@ -820,6 +888,10 @@ class IAConsoApp(NSObject):
                 item.setAttributedTitle_(_window_title(value))
             elif kind == "extra":
                 item.setAttributedTitle_(_extra_title(value))
+            elif kind == "cursor":
+                title = _cursor_period_title(value)
+                if title is not None:
+                    item.setAttributedTitle_(title)
 
     @objc.python_method
     def footer_text(self) -> str:

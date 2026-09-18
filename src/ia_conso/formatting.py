@@ -256,4 +256,18 @@ def dump(snapshot: Snapshot) -> str:
                 lines.append(f"  {title}: {' · '.join(bits)}{age}")
             else:
                 lines.append(f"  {title}: pas encore capturé")
+    if snapshot.cursor is not None:
+        cursor = snapshot.cursor
+        lines.append("cursor")
+        if cursor.error and cursor.period is None:
+            lines.append(f"  {cursor.error}")
+        else:
+            bits = [cursor.plan, cursor.email]
+            if cursor.period:
+                bits.append(f"{percent(cursor.period.percent)}")
+            if cursor.cap:
+                bits.append(f"{money(cursor.used, cursor.currency)} / {money(cursor.cap, cursor.currency)}")
+            lines.append("  " + " · ".join(p for p in bits if p))
+            if cursor.error:
+                lines.append(f"  {cursor.error}")
     return "\n".join(lines) or "aucune donnée"
