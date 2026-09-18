@@ -109,7 +109,16 @@ def freshness_label(is_active: bool, moment: datetime | None, at: datetime | Non
     return f"{status} · {age}"
 
 
+def _next_weekday(today, weekday: int):
+    """Prochaine occurrence du jour (aujourd'hui exclu : un mercredi « prochain » est à +7 j)."""
+    delta = (weekday - today.weekday()) % 7
+    if delta == 0:
+        delta = 7
+    return today + timedelta(days=delta)
+
+
 def _date(local: datetime, today) -> str:
+    """Date complète : « lun. 21 sept. » (année si besoin)."""
     month = MONTHS[local.month - 1]
     day = f"{WEEKDAYS[local.weekday()]} {local.day} {month}"
     if local.year != today.year:
@@ -121,8 +130,9 @@ def pinpoint(moment: datetime | None, at: datetime | None = None) -> str:
     """Horodatage absolu du reset, calibré sur la distance.
 
     - moins de 24 h, aujourd'hui : « 18:20 »
-    - moins de 24 h, demain : « sam. 02:00 »
-    - au-delà : « lun. 21 sept. 04:00 » (année si besoin)
+    - moins de 24 h, demain : « sam. à 02:00 »
+    - prochain jour de la semaine : « mer. à 04:00 »
+    - plus loin : « lun. 21 sept. à 04:00 » (année si besoin)
     """
     if moment is None:
         return ""
@@ -133,14 +143,21 @@ def pinpoint(moment: datetime | None, at: datetime | None = None) -> str:
     tomorrow = today + timedelta(days=1)
     hour = local.strftime("%H:%M")
 
+    def with_day(prefix: str) -> str:
+        return f"{prefix} à {hour}"
+
     if 0 <= left < DAY:
         if local.date() == today:
             return hour
         if local.date() == tomorrow:
-            return f"{WEEKDAYS[local.weekday()]} {hour}"
-        return f"{_date(local, today)} {hour}"
+            return with_day(WEEKDAYS[local.weekday()])
+        if local.date() == _next_weekday(today, local.weekday()):
+            return with_day(WEEKDAYS[local.weekday()])
+        return with_day(_date(local, today))
 
-    return f"{_date(local, today)} {hour}"
+    if local.date() == _next_weekday(today, local.weekday()):
+        return with_day(WEEKDAYS[local.weekday()])
+    return with_day(_date(local, today))
 
 
 def reset_bits(resets_at: datetime | None, *, is_session: bool = False, at: datetime | None = None) -> tuple[str, str]:
