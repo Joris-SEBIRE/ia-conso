@@ -227,7 +227,7 @@ def _append_activity(text, rows) -> None:
     for index, row in enumerate(rows):
         title, is_waiting, since_ms = row[0], row[1], row[2] if len(row) > 2 else 0
         tint = "systemRedColor" if is_waiting else IDENTITY_TINT
-        mark = "- " if is_waiting else "+ "
+        mark = "→ "
         status = "en attente de réponse" if is_waiting else "en cours"
         label = f"{mark}{_crop_activity_title(title)} : {status}"
         if since_ms:
