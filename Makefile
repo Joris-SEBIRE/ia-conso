@@ -37,7 +37,7 @@ stop:                ## Arrête toute instance
 uninstall: stop     ## Retire l'app, le LaunchAgent et l'état local
 	-@launchctl unload -w ~/Library/LaunchAgents/fr.jsebire.ia-conso.plist >/dev/null 2>&1 || true
 	rm -rf $(INSTALLED) ~/Library/LaunchAgents/fr.jsebire.ia-conso.plist
-	rm -rf ~/Library/Application\ Support/IAConso
+	rm -rf ~/Library/Application\ Support/IAConso ~/Library/Caches/IAConso
 
 clean:
 	rm -rf build $(VENV) src/ia_conso/__pycache__

@@ -78,6 +78,17 @@ def reset_line(window: Window, at: datetime | None = None) -> str:
     return f"reset dans {wait}" + (f" · {when}" if when else "")
 
 
+def extra_reset_line(extra, at: datetime | None = None) -> str:
+    if extra.resets_at is None:
+        return "reset mensuel"
+    left = remaining(extra.resets_at, at)
+    when = clock(extra.resets_at)
+    wait = countdown(left)
+    if left <= 0:
+        return "reset imminent"
+    return f"reset dans {wait}" + (f" · {when}" if when else "")
+
+
 def percent(value: float | None) -> str:
     if value is None:
         return "—"
@@ -122,12 +133,33 @@ def dump(snapshot: Snapshot) -> str:
         lines.append(f"semaine      {percent(snapshot.weekly.percent)}  {reset_line(snapshot.weekly)}")
     for window in snapshot.scoped:
         lines.append(f"{window.label:<12} {percent(window.percent)}  {reset_line(window)}")
-    if snapshot.extra and snapshot.extra.is_enabled:
+    if snapshot.extra and snapshot.extra.cap:
         extra = snapshot.extra
         used = f"{money(extra.used, extra.currency)} / {money(extra.cap, extra.currency)}"
-        lines.append(f"extra        {used}" + (f"  {percent(extra.percent)}" if extra.percent else ""))
+        state = "" if extra.is_enabled else "  off"
+        lines.append(
+            f"extra        {used}"
+            + (f"  {percent(extra.percent)}" if extra.percent is not None else "")
+            + state
+            + f"  {extra_reset_line(extra)}"
+        )
     if snapshot.breakdown:
         lines.append("répartition de la semaine")
         for name, share in snapshot.breakdown:
             lines.append(f"  {name:<16} {percent(share)} de la conso")
+    others = [org for org in snapshot.orgs if not org.is_active]
+    if others:
+        lines.append("autres comptes")
+        for org in others:
+            title = org.org_name or org.plan or org.org_id
+            if org.session or org.weekly:
+                bits = []
+                if org.session:
+                    bits.append(f"session {percent(org.session.percent)}")
+                if org.weekly:
+                    bits.append(f"semaine {percent(org.weekly.percent)}")
+                age = f" · lu {ago(org.fetched_at)}" if org.fetched_at else ""
+                lines.append(f"  {title}: {' · '.join(bits)}{age}")
+            else:
+                lines.append(f"  {title}: pas encore capturé")
     return "\n".join(lines) or "aucune donnée"

@@ -21,6 +21,8 @@ class Account:
     name: str
     email: str
     plan: str
+    org_id: str = ""
+    org_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,26 @@ class Extra:
     currency: str
     percent: float | None
     is_enabled: bool
+    resets_at: datetime | None = None
+    disabled_reason: str = ""
+
+
+@dataclass(frozen=True)
+class OrgView:
+    """Une organisation Claude (Pro perso, Team, etc.), active ou mémorisée."""
+
+    org_id: str
+    org_name: str
+    plan: str
+    email: str
+    account_name: str
+    is_active: bool
+    session: Window | None = None
+    weekly: Window | None = None
+    scoped: tuple[Window, ...] = ()
+    extra: Extra | None = None
+    breakdown: tuple[tuple[str, float], ...] = ()
+    fetched_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +70,7 @@ class Snapshot:
     scoped: tuple[Window, ...] = ()
     extra: Extra | None = None
     breakdown: tuple[tuple[str, float], ...] = ()
+    orgs: tuple[OrgView, ...] = ()
     fetched_at: datetime | None = None
     error: str = ""
     token_origin: str = ""

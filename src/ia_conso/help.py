@@ -72,6 +72,13 @@ L'app **ne rafraîchit pas** le token. Un rafraîchissement ferait tourner le je
 Code et casserait Cursor. Si la session a expiré, ouvre Cursor une fois : il la renouvelle, \
 IA-Conso relit le trousseau au cycle suivant.
 
+## Plusieurs organisations
+
+Le token ne voit qu'**une** org à la fois (Pro perso, Team Spacefill, etc.). L'app liste \
+toutes tes orgs « chat », montre la conso en live pour l'active, et mémorise la dernière \
+conso lue pour les autres. Pour mettre à jour une org inactive : bascule dessus dans Cursor, \
+attends un cycle (ou Actualiser).
+
 ## La barre
 
 Un pourcentage, celui de la session 5 h, dans un cercle qui se remplit d'autant. Bleu jusqu'à 20 %, puis vert, jaune, orange, et rouge à partir de 80 %. Un clic ouvre le \

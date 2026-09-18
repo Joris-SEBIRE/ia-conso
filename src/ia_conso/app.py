@@ -1,4 +1,4 @@
-"""Élément de barre des menus : pourcentage de session, anneau, menu détaillé."""
+"""Élément de barre des menus : pourcentage de session, anneau semaine, menu détaillé."""
 
 from __future__ import annotations
 
@@ -11,10 +11,12 @@ from Cocoa import (
     NSApplication,
     NSApplicationActivationPolicyAccessory,
     NSAttributedString,
+    NSBaselineOffsetAttributeName,
     NSBezierPath,
     NSBundle,
     NSColor,
     NSCompositingOperationSourceOver,
+    NSCursor,
     NSFont,
     NSFontAttributeName,
     NSFontWeightLight,
@@ -43,12 +45,13 @@ from Cocoa import (
 )
 from PyObjCTools import AppHelper
 
-from . import IDENTITY_TINT, launchagent
+from . import IDENTITY_TINT, launchagent, shortcuts
 from . import help as manual
-from .anthropic import fetch
+from .anthropic import fetch, org_label
+from .avatars import Avatars
 from .config import CONFIG_PATH, Config
-from .formatting import ago, countdown, money, percent, reset_line, tint_for
-from .models import Snapshot, Window, now
+from .formatting import ago, countdown, extra_reset_line, money, percent, reset_line, tint_for
+from .models import Extra, OrgView, Snapshot, Window, now
 from .state import acquire_single_instance, log_error, write_status
 
 BUNDLE_ID = "fr.jsebire.ia-conso"
@@ -65,9 +68,16 @@ HERO_FONT = 22.0
 CHROME_GLYPH = 11.0
 CHROME_LIFT = 1.75
 LEFT_MARGIN = 6.0
+AVATAR_SIZE = 22.0
 SPINNER_FRAMES = ("◐", "◓", "◑", "◒")
 SPINNER_INTERVAL = 0.13
 BAR_WIDTH = 12
+SHORTCUT_MIN = 84.0
+# « 100 % » : largeur fixe pour aligner les jauges d'un compte à l'autre.
+PERCENT_FIELD = 5
+PERCENT_PAD = "\u2007"  # figure space = largeur d'un chiffre
+BAR_GAP = "  "
+BAR_BASELINE = (HERO_FONT - META_FONT) * 0.35
 
 
 def _colour(name: str):
@@ -84,73 +94,130 @@ def _paragraph(before: float = 0.0, after: float = 1.0):
     return style
 
 
-def _run(text: str, size: float, color=None, weight=None, paragraph=None):
+def _run(text: str, size: float, color=None, weight=None, paragraph=None, mono: bool = False, baseline: float = 0.0):
     attributes = {
         NSFontAttributeName: (
-            NSFont.systemFontOfSize_(size) if weight is None else NSFont.systemFontOfSize_weight_(size, weight)
+            NSFont.monospacedDigitSystemFontOfSize_weight_(size, weight or NSFontWeightSemibold)
+            if mono
+            else (
+                NSFont.systemFontOfSize_(size)
+                if weight is None
+                else NSFont.systemFontOfSize_weight_(size, weight)
+            )
         )
     }
     if color is not None:
         attributes[NSForegroundColorAttributeName] = color
     if paragraph is not None:
         attributes[NSParagraphStyleAttributeName] = paragraph
+    if baseline:
+        attributes[NSBaselineOffsetAttributeName] = baseline
     return NSAttributedString.alloc().initWithString_attributes_(text, attributes)
 
 
 def _bar(value: float, width: int = BAR_WIDTH) -> str:
-    """Barre textuelle remplie au pourcentage, pour lire la conso d'un coup d'œil."""
     filled = max(0, min(width, int(round(value / 100.0 * width))))
     return "█" * filled + "░" * (width - filled)
 
 
-def _window_title(window: Window):
-    """Bloc d'une fenêtre de quota : libellé, pourcentage coloré, barre, reset."""
-    tint = _colour(tint_for(window.percent))
+def _percent_field(value: float | None) -> str:
+    return percent(value).rjust(PERCENT_FIELD, PERCENT_PAD)
+
+
+def _meter_title(label: str, value: float | None, detail: str, reset: str):
+    """Bloc commun : libellé + reset, puis « N %  ████ », puis détail éventuel."""
+    tint = _colour(tint_for(value))
     grey = NSColor.secondaryLabelColor()
-    head = _paragraph()
-    body = _paragraph(before=2.0)
-    foot = _paragraph(before=1.0)
     text = NSMutableAttributedString.alloc().init()
     text.appendAttributedString_(
-        _run(window.label.upper(), HEADER_FONT, color=tint, weight=NSFontWeightSemibold, paragraph=head)
+        _run(label.upper(), HEADER_FONT, color=tint, weight=NSFontWeightSemibold, paragraph=_paragraph())
     )
+    if reset:
+        text.appendAttributedString_(
+            _run(f"  ·  {reset}", META_FONT, color=grey, weight=NSFontWeightMedium)
+        )
+    # Chiffre et jauge sur la même ligne, chacun dans une zone de largeur fixe.
     text.appendAttributedString_(
         _run(
-            f"\n{percent(window.percent)}",
+            f"\n{_percent_field(value)}",
             HERO_FONT,
             color=tint,
             weight=NSFontWeightSemibold,
-            paragraph=body,
+            paragraph=_paragraph(before=2.0),
+            mono=True,
         )
     )
-    text.appendAttributedString_(
-        _run(f"\n{_bar(window.percent)}", META_FONT, color=tint.colorWithAlphaComponent_(0.85), paragraph=foot)
-    )
-    text.appendAttributedString_(
-        _run(f"\n{reset_line(window)}", META_FONT, color=grey, weight=NSFontWeightMedium, paragraph=foot)
-    )
-    return text
-
-
-def _account_title(name: str, meta: str):
-    text = NSMutableAttributedString.alloc().init()
-    text.appendAttributedString_(_run(name, TITLE_FONT, weight=NSFontWeightSemibold, paragraph=_paragraph()))
-    if meta:
+    if value is not None:
         text.appendAttributedString_(
-            _run(f"\n{meta}", META_FONT, color=NSColor.secondaryLabelColor(), paragraph=_paragraph(before=1.0))
+            _run(
+                f"{BAR_GAP}{_bar(value)}",
+                META_FONT,
+                color=tint.colorWithAlphaComponent_(0.85),
+                weight=NSFontWeightMedium,
+                mono=True,
+                baseline=BAR_BASELINE,
+            )
         )
-    return text
-
-
-def _section_title(label: str, detail: str, tint: str = IDENTITY_TINT):
-    text = NSMutableAttributedString.alloc().init()
-    text.appendAttributedString_(
-        _run(label.upper(), HEADER_FONT, color=_colour(tint), weight=NSFontWeightSemibold, paragraph=_paragraph())
-    )
     if detail:
         text.appendAttributedString_(
-            _run(f"\n{detail}", TITLE_FONT, weight=NSFontWeightMedium, paragraph=_paragraph(before=2.0))
+            _run(f"\n{detail}", META_FONT, color=grey, weight=NSFontWeightMedium, paragraph=_paragraph(before=1.0))
         )
+    return text
+
+
+def _window_title(window: Window):
+    return _meter_title(window.label, window.percent, "", reset_line(window))
+
+
+def _extra_title(extra: Extra):
+    detail = f"{money(extra.used, extra.currency)} / {money(extra.cap, extra.currency)}"
+    if not extra.is_enabled:
+        why = {
+            "out_of_credits": "crédits épuisés",
+            "user_disabled": "désactivé manuellement",
+        }.get(extra.disabled_reason, "désactivé")
+        detail = f"{detail} · {why}"
+    value = extra.percent if extra.percent is not None else (
+        (100.0 * extra.used / extra.cap) if extra.cap else 0.0
+    )
+    return _meter_title("extra", value, detail, extra_reset_line(extra))
+
+
+def _account_header(org: OrgView):
+    grey = NSColor.secondaryLabelColor()
+    title = org_label(org.org_name, org.plan)
+    status = "actif" if org.is_active else "inactif"
+    meta = " · ".join(p for p in (org.email, org.plan, status) if p)
+    if org.fetched_at:
+        meta = f"{meta} · lu {ago(org.fetched_at)}" if meta else f"lu {ago(org.fetched_at)}"
+    text = NSMutableAttributedString.alloc().init()
+    text.appendAttributedString_(_run(title, TITLE_FONT, weight=NSFontWeightSemibold, paragraph=_paragraph()))
+    if meta:
+        text.appendAttributedString_(
+            _run(f"\n{meta}", META_FONT, color=grey, paragraph=_paragraph(before=1.0))
+        )
+    return text
+
+
+def _org_summary(org: OrgView):
+    grey = NSColor.secondaryLabelColor()
+    tint = _colour(tint_for(org.session.percent if org.session else None))
+    title = org_label(org.org_name, org.plan)
+    text = NSMutableAttributedString.alloc().init()
+    text.appendAttributedString_(_run(title, TITLE_FONT, weight=NSFontWeightSemibold, paragraph=_paragraph()))
+    parts = []
+    if org.session:
+        parts.append(f"session {percent(org.session.percent)}")
+    if org.weekly:
+        parts.append(f"semaine {percent(org.weekly.percent)}")
+    if org.extra and org.extra.cap:
+        parts.append(f"extra {percent(org.extra.percent)}")
+    if parts:
+        text.appendAttributedString_(
+            _run("\n" + "  ·  ".join(parts), TITLE_FONT, color=tint, weight=NSFontWeightMedium, paragraph=_paragraph(before=2.0))
+        )
+    age = f"lu {ago(org.fetched_at)}" if org.fetched_at else "pas encore capturé"
+    text.appendAttributedString_(_run(f"\n{age}", META_FONT, color=grey, paragraph=_paragraph(before=1.0)))
     return text
 
 
@@ -197,8 +264,24 @@ def _chrome_symbol(name: str, tint: str = ""):
 _CHROME: dict = {}
 
 
+def _face(avatars: Avatars, email: str, fallback: str = "person.crop.circle", tint: str = IDENTITY_TINT):
+    photo = avatars.image(email, AVATAR_SIZE)
+    if photo is not None:
+        # Même marge de gauche que les glyphes chrome, pour aligner les textes.
+        canvas = NSImage.alloc().initWithSize_(NSMakeSize(AVATAR_SIZE + LEFT_MARGIN, AVATAR_SIZE))
+        canvas.lockFocus()
+        photo.drawInRect_fromRect_operation_fraction_(
+            NSMakeRect(LEFT_MARGIN, 0, AVATAR_SIZE, AVATAR_SIZE),
+            NSZeroRect,
+            NSCompositingOperationSourceOver,
+            1.0,
+        )
+        canvas.unlockFocus()
+        return canvas
+    return _chrome_symbol(fallback, tint)
+
+
 def _fit_label(label: str, tint, room: float):
-    """Police la plus grande dont le chiffre tient dans le diamètre intérieur du cercle."""
     size_pt = room
     while size_pt >= 5.0:
         drawn = NSAttributedString.alloc().initWithString_attributes_(
@@ -215,24 +298,24 @@ def _fit_label(label: str, tint, room: float):
     return drawn, box
 
 
-def _badge(value: float | None) -> object:
-    """Pourcentage de la session 5 h, dans un cercle qui se remplit d'autant."""
+def _badge(session_percent: float | None, weekly_percent: float | None) -> object:
+    """Chiffre = session 5 h (teintée) ; anneau = conso semaine (rempli et teinté)."""
     size = RING_SIZE
     canvas = NSImage.alloc().initWithSize_(NSMakeSize(size, size))
-    tint_name = tint_for(value)
-    label = "—" if value is None else str(int(round(max(0.0, min(100.0, value)))))
-    fraction = 0.0 if value is None else max(0.0, min(1.0, value / 100.0))
-    # Diamètre utile : intérieur du trait, moins 3 pt de marge pour ne pas frôler l'anneau.
+    ring_tint = tint_for(weekly_percent)
+    digit_tint = tint_for(session_percent)
+    label = "—" if session_percent is None else str(int(round(max(0.0, min(100.0, session_percent)))))
+    fraction = 0.0 if weekly_percent is None else max(0.0, min(1.0, weekly_percent / 100.0))
     room = size - 2 * (RING_WIDTH + 3.0)
 
     def paint():
         canvas.lockFocus()
-        tint = _colour(tint_name)
+        ring = _colour(ring_tint)
         track = NSBezierPath.bezierPathWithOvalInRect_(
             NSMakeRect(RING_WIDTH / 2, RING_WIDTH / 2, size - RING_WIDTH, size - RING_WIDTH)
         )
         track.setLineWidth_(RING_WIDTH)
-        tint.colorWithAlphaComponent_(RING_TRACK_ALPHA).setStroke()
+        ring.colorWithAlphaComponent_(RING_TRACK_ALPHA).setStroke()
         track.stroke()
         if fraction > 0:
             middle = size / 2
@@ -241,9 +324,9 @@ def _badge(value: float | None) -> object:
                 (middle, middle), (size - RING_WIDTH) / 2, 90.0, 90.0 - 360.0 * fraction, True
             )
             arc.setLineWidth_(RING_WIDTH)
-            tint.setStroke()
+            ring.setStroke()
             arc.stroke()
-        drawn, box = _fit_label(label, tint, room)
+        drawn, box = _fit_label(label, _colour(digit_tint), room)
         drawn.drawAtPoint_(NSMakePoint((size - box.width) / 2, (size - box.height) / 2))
         canvas.unlockFocus()
 
@@ -281,6 +364,7 @@ class IAConsoApp(NSObject):
         self.cfg = Config.load()
         self.cfg_mtime = self.config_mtime()
         self.snapshot = Snapshot()
+        self.avatars = Avatars()
         self.fetching = False
         self.fetch_started = None
         self.fetch_epoch = 0
@@ -289,6 +373,10 @@ class IAConsoApp(NSObject):
         self.shown = None
         self.footer_item = None
         self.updated_item = None
+        self.footer_rows = []
+        self.footer_active = []
+        self.shortcut_row = None
+        self.hover_timer = None
         self.help_window = None
         self.show_spinner = False
         self.spinner_frame = 0
@@ -327,12 +415,41 @@ class IAConsoApp(NSObject):
         if self.countdown() <= 0:
             self.start_fetch()
 
+    def menuNeedsUpdate_(self, menu):
+        try:
+            self.build_menu(menu)
+        except Exception as exc:
+            log_error(f"menu : {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+            menu.removeAllItems()
+            self.add_info(menu, f"menu cassé : {type(exc).__name__}: {exc}")
+
     def menuWillOpen_(self, menu):
         self.menu_open = True
-        self.build_menu(menu)
+        if self.hover_timer is None:
+            self.hover_timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+                shortcuts.POLL_SECONDS, self, "hover:", None, True
+            )
+            NSRunLoop.currentRunLoop().addTimer_forMode_(self.hover_timer, NSRunLoopCommonModes)
+
+    def hover_(self, timer):
+        row = self.shortcut_row
+        if row is None:
+            return
+        zone = row.hovered()
+        row.set_hover(zone)
+        if zone is None:
+            return
+        row.setToolTip_(row.tip_of(zone))
+        (NSCursor.pointingHandCursor() if row.enabled_at(zone) else NSCursor.arrowCursor()).set()
 
     def menuDidClose_(self, menu):
         self.menu_open = False
+        if self.hover_timer is not None:
+            self.hover_timer.invalidate()
+            self.hover_timer = None
+        if self.shortcut_row is not None:
+            self.shortcut_row.set_hover(None)
+        NSCursor.arrowCursor().set()
 
     def wake_(self, notification):
         self.start_fetch(force=True)
@@ -388,6 +505,10 @@ class IAConsoApp(NSObject):
         self.fetch_local.epoch = epoch
         try:
             snapshot = fetch()
+            emails = {org.email for org in snapshot.orgs if org.email}
+            if snapshot.account and snapshot.account.email:
+                emails.add(snapshot.account.email)
+            self.avatars.prefetch(emails)
             self.land(self.apply_snapshot, snapshot)
         except Exception as exc:
             log_error(f"cycle interrompu : {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
@@ -410,7 +531,6 @@ class IAConsoApp(NSObject):
 
     @objc.python_method
     def apply_snapshot(self, snapshot: Snapshot) -> None:
-        # Un cycle en erreur ne doit pas effacer le dernier pourcentage encore lisible.
         if snapshot.error and self.snapshot.session is not None and snapshot.session is None:
             snapshot = Snapshot(
                 account=snapshot.account or self.snapshot.account,
@@ -419,6 +539,7 @@ class IAConsoApp(NSObject):
                 scoped=self.snapshot.scoped,
                 extra=self.snapshot.extra,
                 breakdown=self.snapshot.breakdown,
+                orgs=snapshot.orgs or self.snapshot.orgs,
                 fetched_at=self.snapshot.fetched_at,
                 error=snapshot.error,
                 token_origin=snapshot.token_origin or self.snapshot.token_origin,
@@ -474,24 +595,44 @@ class IAConsoApp(NSObject):
         if self.status_item is None or self.show_spinner:
             return
         session = self.snapshot.session
-        value = session.percent if session else None
+        weekly = self.snapshot.weekly
         button = self.status_item.button()
-        button.setImage_(_badge(value))
+        button.setImage_(
+            _badge(
+                session.percent if session else None,
+                weekly.percent if weekly else None,
+            )
+        )
         button.setTitle_("")
+        tips = []
         if session:
-            tip = f"IA-Conso — session 5 h {percent(session.percent)}"
-            if session.resets_at:
-                tip += f", {reset_line(session)}"
-        elif self.snapshot.error:
+            tips.append(f"session {percent(session.percent)}")
+        if weekly:
+            tips.append(f"semaine {percent(weekly.percent)}")
+        if self.snapshot.error and not tips:
             tip = f"IA-Conso — {self.snapshot.error}"
+        elif tips:
+            tip = "IA-Conso — " + " · ".join(tips)
         else:
             tip = "IA-Conso"
         button.setToolTip_(tip)
         write_status(
             {
                 "session": session.percent if session else None,
-                "weekly": self.snapshot.weekly.percent if self.snapshot.weekly else None,
+                "weekly": weekly.percent if weekly else None,
                 "account": self.snapshot.account.email if self.snapshot.account else "",
+                "org": self.snapshot.account.org_name if self.snapshot.account else "",
+                "orgs": [
+                    {
+                        "id": org.org_id,
+                        "name": org.org_name,
+                        "active": org.is_active,
+                        "session": org.session.percent if org.session else None,
+                        "weekly": org.weekly.percent if org.weekly else None,
+                        "maj": org.fetched_at.isoformat() if org.fetched_at else None,
+                    }
+                    for org in self.snapshot.orgs
+                ],
                 "error": self.snapshot.error,
                 "maj": self.snapshot.fetched_at.isoformat() if self.snapshot.fetched_at else None,
             }
@@ -507,6 +648,7 @@ class IAConsoApp(NSObject):
             snap.scoped,
             snap.extra,
             snap.breakdown,
+            snap.orgs,
             snap.error,
             launchagent.is_enabled(),
         )
@@ -514,102 +656,127 @@ class IAConsoApp(NSObject):
     @objc.python_method
     def build_menu(self, menu) -> None:
         menu.removeAllItems()
+        menu.setShowsStateColumn_(False)
         snap = self.snapshot
         self.shown = self.contents()
         self.updated_item = None
+        self.footer_rows, self.footer_active = [], []
+        self.shortcut_row = None
 
-        if snap.account:
-            who = snap.account
-            meta = " · ".join(p for p in (who.email, who.plan) if p)
-            self.add_rich(menu, _account_title(who.name or who.email, meta), "person.crop.circle", IDENTITY_TINT)
-        elif snap.error:
-            self.add_title(menu, "Compte introuvable", "person.crop.circle.badge.exclamationmark", "systemYellowColor")
+        if snap.error and not snap.orgs:
+            self.add_info(menu, snap.error)
 
-        if snap.error:
-            self.add_info(menu, snap.error, "exclamationmark.triangle")
+        active = next((org for org in snap.orgs if org.is_active), None)
+        others = [org for org in snap.orgs if not org.is_active]
+        # Un inactif en détail maxi ; le reste en résumé.
+        detailed_other = others[:1]
+        summarized = others[1:]
 
-        if snap.session or snap.weekly or snap.scoped:
+        if active:
+            self.add_org(menu, active)
+        elif snap.account:
+            # Pas encore d'orgs listées : repli sur le snapshot plat.
+            self.add_flat_account(menu, snap)
+
+        if detailed_other:
             menu.addItem_(NSMenuItem.separatorItem())
+            self.add_org(menu, detailed_other[0])
 
-        if snap.session:
-            self.add_window(menu, snap.session, "timer")
-        if snap.weekly:
-            if snap.session:
-                menu.addItem_(NSMenuItem.separatorItem())
-            self.add_window(menu, snap.weekly, "calendar")
-        for window in snap.scoped:
+        if summarized:
             menu.addItem_(NSMenuItem.separatorItem())
-            self.add_window(menu, window, "square.stack")
-
-        if snap.extra and snap.extra.is_enabled:
-            menu.addItem_(NSMenuItem.separatorItem())
-            extra = snap.extra
-            used = f"{money(extra.used, extra.currency)} / {money(extra.cap, extra.currency)}"
-            if extra.percent:
-                used += f"  ·  {percent(extra.percent)}"
-            tint = tint_for(extra.percent) if extra.percent else IDENTITY_TINT
-            self.add_rich(menu, _section_title("Extra", used, tint), "creditcard", tint)
-            self.add_info(menu, "crédits une fois le plan saturé")
-
-        if snap.breakdown:
-            rows = [(name, share) for name, share in snap.breakdown if share > 0]
-            if rows:
-                menu.addItem_(NSMenuItem.separatorItem())
-                self.add_title(menu, "Répartition de la semaine", "chart.bar", IDENTITY_TINT)
-                for name, share in rows:
-                    self.add_info(menu, f"{name}  ·  {percent(share)} de la conso")
+            for org in summarized:
+                self.add_rich(menu, _org_summary(org), image=_face(self.avatars, org.email))
 
         menu.addItem_(NSMenuItem.separatorItem())
         self.add_footer(menu)
+        self.add_shortcuts(menu)
 
     @objc.python_method
-    def add_window(self, menu, window, symbol: str) -> None:
-        tint = tint_for(window.percent)
+    def add_flat_account(self, menu, snap: Snapshot) -> None:
+        who = snap.account
+        label = org_label(who.org_name, who.plan) if who.org_name else (who.name or who.email)
+        meta = " · ".join(p for p in (who.email, who.plan, "actif") if p)
+        header = NSMutableAttributedString.alloc().init()
+        header.appendAttributedString_(_run(label, TITLE_FONT, weight=NSFontWeightSemibold, paragraph=_paragraph()))
+        header.appendAttributedString_(
+            _run(f"\n{meta}", META_FONT, color=NSColor.secondaryLabelColor(), paragraph=_paragraph(before=1.0))
+        )
+        self.add_rich(menu, header, image=_face(self.avatars, who.email))
+        if snap.error:
+            self.add_info(menu, snap.error)
+        if snap.session:
+            self.add_window(menu, snap.session)
+        if snap.weekly:
+            self.add_window(menu, snap.weekly)
+        for window in snap.scoped:
+            self.add_window(menu, window)
+        if snap.extra and snap.extra.cap:
+            self.add_extra(menu, snap.extra)
+        for name, share in snap.breakdown:
+            if share > 0:
+                self.add_info(menu, f"{name}  ·  {percent(share)} de la conso")
+
+    @objc.python_method
+    def add_org(self, menu, org: OrgView) -> None:
+        self.add_rich(menu, _account_header(org), image=_face(self.avatars, org.email))
+        if org.session:
+            self.add_window(menu, org.session)
+        if org.weekly:
+            self.add_window(menu, org.weekly)
+        for window in org.scoped:
+            self.add_window(menu, window)
+        if org.extra and org.extra.cap:
+            self.add_extra(menu, org.extra)
+        for name, share in org.breakdown:
+            if share > 0:
+                self.add_info(menu, f"{name}  ·  {percent(share)} de la conso")
+        if not org.is_active and not (org.session or org.weekly or org.extra):
+            self.add_info(menu, "passe sur ce compte une fois pour capturer la conso")
+
+    @objc.python_method
+    def add_window(self, menu, window: Window) -> None:
         row = NSMenuItem.alloc().init()
         row.setAttributedTitle_(_window_title(window))
-        row.setImage_(_chrome_symbol(symbol, tint))
         row.setEnabled_(False)
-        row.setRepresentedObject_(window)
+        row.setRepresentedObject_(("window", window))
         menu.addItem_(row)
 
     @objc.python_method
-    def add_rich(self, menu, title, symbol: str = "", tint: str = "") -> NSMenuItem:
+    def add_extra(self, menu, extra: Extra) -> None:
+        row = NSMenuItem.alloc().init()
+        row.setAttributedTitle_(_extra_title(extra))
+        row.setEnabled_(False)
+        row.setRepresentedObject_(("extra", extra))
+        menu.addItem_(row)
+
+    @objc.python_method
+    def add_rich(self, menu, title, image=None) -> NSMenuItem:
         row = NSMenuItem.alloc().init()
         row.setAttributedTitle_(title)
-        if symbol:
-            row.setImage_(_chrome_symbol(symbol, tint))
+        if image is not None:
+            row.setImage_(image)
         row.setEnabled_(False)
         menu.addItem_(row)
         return row
 
     @objc.python_method
-    def add_title(self, menu, text: str, symbol: str, tint: str) -> None:
-        label = "RÉPARTITION DE LA SEMAINE" if text.startswith("Répartition") else text
-        size = HEADER_FONT if text.startswith("Répartition") else TITLE_FONT
-        color = _colour(tint) if text.startswith("Répartition") else None
-        row = NSMenuItem.alloc().init()
-        row.setAttributedTitle_(_run(label, size, color=color, weight=NSFontWeightSemibold))
-        row.setImage_(_chrome_symbol(symbol, tint))
-        row.setEnabled_(False)
-        menu.addItem_(row)
-
-    @objc.python_method
-    def add_info(self, menu, text: str, symbol: str = "") -> None:
+    def add_info(self, menu, text: str) -> None:
         row = NSMenuItem.alloc().init()
         row.setAttributedTitle_(_run(text, META_FONT, color=NSColor.secondaryLabelColor()))
-        if symbol:
-            row.setImage_(_chrome_symbol(symbol))
         row.setEnabled_(False)
         menu.addItem_(row)
 
     @objc.python_method
     def refresh_live(self) -> None:
-        """Le décompte du reset et l'âge de la lecture avancent menu ouvert."""
         for item in self.menu.itemArray():
-            window = item.representedObject()
-            if window is None:
+            payload = item.representedObject()
+            if not isinstance(payload, tuple) or len(payload) != 2:
                 continue
-            item.setAttributedTitle_(_window_title(window))
+            kind, value = payload
+            if kind == "window":
+                item.setAttributedTitle_(_window_title(value))
+            elif kind == "extra":
+                item.setAttributedTitle_(_extra_title(value))
         if self.updated_item is not None:
             self.updated_item.setAttributedTitle_(self.updated_title())
 
@@ -654,14 +821,14 @@ class IAConsoApp(NSObject):
     def add_footer(self, menu) -> None:
         self.updated_item = NSMenuItem.alloc().init()
         self.updated_item.setAttributedTitle_(self.updated_title())
-        self.updated_item.setImage_(_chrome_symbol("clock"))
         self.updated_item.setEnabled_(False)
         menu.addItem_(self.updated_item)
 
         self.footer_item = self.add_action(menu, "", "refresh:", "r", "arrow.clockwise")
         self.footer_item.setAttributedTitle_(self.refresh_title())
         self.footer_item.setToolTip_("Actualiser maintenant (⌘R)")
-        menu.addItem_(NSMenuItem.separatorItem())
+        self.footer_rows.append((self.footer_item, "arrow.clockwise"))
+
         if self.bundle_program():
             started = launchagent.is_enabled()
             row = self.add_action(
@@ -672,9 +839,65 @@ class IAConsoApp(NSObject):
                 if started
                 else "Lancer au démarrage : désactivé, cliquer pour activer"
             )
-        self.add_action(menu, "Comment ça marche", "openHelp:", ",", "questionmark.circle")
+            self.footer_rows.append((row, "power"))
+            if started:
+                self.footer_active.append(row)
+
+        row = self.add_action(menu, "Comment ça marche", "openHelp:", ",", "questionmark.circle")
+        row.setToolTip_("Comment ça marche (⌘,)")
+        self.footer_rows.append((row, "questionmark.circle"))
+
         row = self.add_action(menu, "Quitter IA-Conso", "quitApp:", "q", "xmark.circle")
         row.setToolTip_("Quitter IA-Conso (⌘Q)")
+        self.footer_rows.append((row, "xmark.circle"))
+
+    @objc.python_method
+    def add_shortcuts(self, menu) -> None:
+        entries = []
+        for item, symbol in self.footer_rows:
+            action = item.action()
+            label = str(item.attributedTitle().string()) if item.attributedTitle() else str(item.title())
+            # Sur la barre rapide, on garde le premier mot : « Actualiser », « Lancer », etc.
+            short = label.split("   ")[0].split("  ✓")[0]
+            if short.startswith("Lancer"):
+                short = "Démarrage"
+            elif short.startswith("Comment"):
+                short = "Aide"
+            elif short.startswith("Quitter"):
+                short = "Quitter"
+            entries.append(
+                (
+                    symbol,
+                    short,
+                    str(action) if action and item.isEnabled() else None,
+                    getattr(NSColor, IDENTITY_TINT)() if item in self.footer_active else None,
+                    item in self.footer_active,
+                    str(item.toolTip() or "") or short,
+                )
+            )
+        if not entries:
+            return
+        width = max(menu.size().width, SHORTCUT_MIN * len(entries))
+        row = shortcuts.Shortcuts.alloc().initWithFrame_(NSMakeRect(0, 0, width, shortcuts.ROW_HEIGHT))
+        row.load(entries)
+        row.on_pick = self.run_shortcut
+        holder = NSMenuItem.alloc().init()
+        holder.setView_(row)
+        menu.insertItem_atIndex_(holder, 0)
+        menu.insertItem_atIndex_(NSMenuItem.separatorItem(), 1)
+        self.shortcut_row = row
+
+    @objc.python_method
+    def run_shortcut(self, action: str) -> None:
+        menu = self.status_item.menu() if self.status_item is not None else None
+        if menu is not None:
+            menu.cancelTracking()
+        self.performSelector_withObject_afterDelay_("runDeferred:", action, 0.0)
+
+    def runDeferred_(self, action):
+        handler = getattr(self, str(action).replace(":", "_"), None)
+        if handler is not None:
+            handler(self)
 
     @objc.python_method
     def add_action(self, menu, label: str, selector: str, key: str = "", symbol: str = ""):
