@@ -12,21 +12,29 @@ import json
 import subprocess
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
-from pathlib import Path
 
-from .models import Account, Extra, OrgView, Snapshot, Window, now, parse_ts
-from .state import cached_org, remember_org
+from .models import Account, AccountView, Extra, Refill, Snapshot, Window, now, parse_ts
+from .paths import CLAUDE_JSON
+from .state import cached_account_view, remember_account_view
 
 KEYCHAIN_SERVICE = "Claude Code-credentials"
-CLAUDE_JSON = Path.home() / ".claude.json"
-USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+# `at_wall=1` est ce que Claude Code demande quand il veut connaître les remises à zéro
+# proposées : sans ce paramètre, le serveur ne renvoie tout simplement pas les blocs d'offre.
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage?at_wall=1"
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 ACCOUNT_URL = "https://api.anthropic.com/api/oauth/account"
 # Sans cet en-tête, l'endpoint range l'appel dans un seau 429 agressif. C'est le même que
 # celui de Claude Code, qui est le client légitime de cet OAuth.
 USER_AGENT = "claude-code/2.0.0"
 BETA = "oauth-2025-04-20"
+# Le garde-fou de cycle bloqué doit rester au-dessus de la somme des délais : on les tient courts.
+HTTP_TIMEOUT = 8
+KEYCHAIN_TIMEOUT = 10
+# Claude Code propose parfois de remettre une limite à zéro. L'offre voyage sous des clés à nom
+# de code, qui changent d'une expérience à l'autre : on lit celles qu'on connaît, et l'absence
+# de la clé est le cas normal, pas une anomalie.
+SESSION_RESET_KEY = "juniper_tide"
+GRANTS_KEY = "cedar_ember"
 PLANS = {
     "claude_pro": "Claude Pro",
     "claude_max": "Claude Max",
@@ -48,7 +56,7 @@ class ClaudeError(Exception):
 
 def _run(cmd: list[str]) -> str | None:
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=KEYCHAIN_TIMEOUT)
     except (OSError, subprocess.SubprocessError):
         return None
     return out.stdout.strip() or None if out.returncode == 0 else None
@@ -57,9 +65,7 @@ def _run(cmd: list[str]) -> str | None:
 def read_token() -> tuple[str, str]:
     raw = _run(["/usr/bin/security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
     if not raw:
-        raise ClaudeError(
-            "Aucun compte Claude Code dans le trousseau. Ouvre Cursor ou lance Claude Code une fois."
-        )
+        raise ClaudeError("Aucun compte Claude Code dans le trousseau. Ouvre Cursor ou lance Claude Code une fois.")
     try:
         blob = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -80,24 +86,21 @@ def cached_account() -> Account | None:
         return None
     try:
         raw = json.loads(CLAUDE_JSON.read_text() or "{}")
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError, UnicodeError):
         return None
     info = raw.get("oauthAccount") if isinstance(raw, dict) else None
     if not isinstance(info, dict):
         return None
     email = str(info.get("emailAddress") or "")
     name = str(info.get("fullName") or info.get("displayName") or "")
-    plan = PLANS.get(str(info.get("organizationType") or ""), "")
-    org_id = str(info.get("organizationUuid") or "")
-    org_name = str(info.get("organizationName") or "")
     if not email and not name:
         return None
     return Account(
         name=name or email,
         email=email,
-        plan=plan or "Claude",
-        org_id=org_id,
-        org_name=org_name,
+        plan=PLANS.get(str(info.get("organizationType") or ""), "") or "Claude",
+        org_id=str(info.get("organizationUuid") or ""),
+        org_name=str(info.get("organizationName") or ""),
     )
 
 
@@ -113,8 +116,8 @@ def _get(url: str, token: str) -> dict:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            return json.loads(resp.read() or b"{}")
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            payload = resp.read() or b"{}"
     except urllib.error.HTTPError as exc:
         retry = None
         if header := exc.headers.get("Retry-After"):
@@ -122,7 +125,7 @@ def _get(url: str, token: str) -> dict:
                 retry = int(header.strip())
             except ValueError:
                 retry = None
-        detail = (exc.read() or b"").decode()[:200]
+        detail = (exc.read() or b"").decode(errors="replace")[:200]
         if exc.code == 401:
             raise ClaudeError(
                 "Session Claude expirée. Ouvre Cursor ou Claude Code une fois pour la renouveler.",
@@ -138,6 +141,14 @@ def _get(url: str, token: str) -> dict:
         raise ClaudeError(f"Anthropic {exc.code} : {detail}", status=exc.code, retry_after=retry) from exc
     except urllib.error.URLError as exc:
         raise ClaudeError("Réseau injoignable.") from exc
+    except OSError as exc:
+        # Timeout de lecture, coupure de socket : ne passe pas par URLError.
+        raise ClaudeError(f"Réseau interrompu : {exc}") from exc
+    try:
+        data = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ClaudeError("Anthropic a répondu autre chose que du JSON (portail captif ?).") from exc
+    return data if isinstance(data, dict) else {}
 
 
 def _window(percent, resets_at, label: str, is_session: bool = False) -> Window | None:
@@ -169,6 +180,9 @@ def _from_limits(data: dict) -> tuple[Window | None, Window | None, list[Window]
         elif kind == "weekly_all":
             weekly = _window(entry.get("percent"), entry.get("resets_at"), "semaine", False)
         elif kind == "weekly_scoped":
+            # Un plafond par modèle jamais entamé n'apprend rien, et porte parfois un nom de code.
+            if not entry.get("is_active") and not entry.get("percent"):
+                continue
             label = _scope_label(entry.get("scope") if isinstance(entry.get("scope"), dict) else None)
             if window := _window(entry.get("percent"), entry.get("resets_at"), f"semaine {label}"):
                 scoped.append(window)
@@ -195,50 +209,102 @@ def _money(block: dict | None) -> tuple[float | None, str]:
     return float(block["amount_minor"]) / (10**exponent), str(block.get("currency") or "EUR")
 
 
-def next_month_start(at: datetime | None = None) -> datetime:
-    """Les crédits extra se réarmant au mois civil, le prochain 1er à minuit UTC."""
-    current = (at or now()).astimezone(timezone.utc)
-    if current.month == 12:
-        return datetime(current.year + 1, 1, 1, tzinfo=timezone.utc)
-    return datetime(current.year, current.month + 1, 1, tzinfo=timezone.utc)
-
-
 def _extra(data: dict) -> Extra | None:
-    resets = next_month_start()
+    """Crédits hors forfait.
+
+    Aucun endpoint ne date leur remise à zéro : `resets_at` reste vide, et l'affichage dit
+    « reset mensuel » plutôt que d'inventer une échéance au jour près.
+    """
     spend = data.get("spend") if isinstance(data.get("spend"), dict) else {}
-    used, currency = _money(spend.get("used") if isinstance(spend.get("used"), dict) else None)
-    cap, cap_currency = _money(spend.get("limit") if isinstance(spend.get("limit"), dict) else None)
-    if used is not None and cap:
-        percent = spend.get("percent")
-        try:
-            value = float(percent) if percent is not None else None
-        except (TypeError, ValueError):
-            value = None
-        return Extra(
-            used=used,
-            cap=cap,
-            currency=cap_currency or currency,
-            percent=value,
-            is_enabled=bool(spend.get("enabled", True)),
-            resets_at=resets,
-            disabled_reason=str(spend.get("disabled_reason") or ""),
-        )
+    if spend:
+        used, currency = _money(spend.get("used") if isinstance(spend.get("used"), dict) else None)
+        cap, cap_currency = _money(spend.get("limit") if isinstance(spend.get("limit"), dict) else None)
+        reason = str(spend.get("disabled_reason") or "")
+        enabled = bool(spend.get("enabled", True))
+        # Sans plafond, il n'y a de ligne à montrer que pour dire pourquoi c'est coupé.
+        if used is not None and (cap or (not enabled and reason)):
+            percent = spend.get("percent")
+            try:
+                value = float(percent) if percent is not None else None
+            except (TypeError, ValueError):
+                value = None
+            return Extra(
+                used=used,
+                cap=cap or 0.0,
+                currency=cap_currency or currency,
+                percent=value,
+                is_enabled=enabled,
+                disabled_reason=reason,
+            )
     extra = data.get("extra_usage") if isinstance(data.get("extra_usage"), dict) else {}
-    if not extra.get("is_enabled") and extra.get("monthly_limit") is None:
+    if not extra:
         return None
     places = int(extra.get("decimal_places") or 2)
     cap_raw = extra.get("monthly_limit")
-    if cap_raw is None:
+    reason = str(extra.get("disabled_reason") or "")
+    enabled = bool(extra.get("is_enabled", True))
+    if cap_raw is None and (enabled or not reason):
         return None
     return Extra(
         used=float(extra.get("used_credits") or 0) / (10**places),
-        cap=float(cap_raw) / (10**places),
+        cap=float(cap_raw or 0) / (10**places),
         currency=str(extra.get("currency") or "EUR"),
         percent=float(extra["utilization"]) if extra.get("utilization") is not None else None,
-        is_enabled=bool(extra.get("is_enabled", True)),
-        resets_at=resets,
-        disabled_reason=str(extra.get("disabled_reason") or ""),
+        is_enabled=enabled,
+        disabled_reason=reason,
     )
+
+
+def _whole(value, fallback: int | None = None) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _refills(data: dict) -> tuple[Refill, ...]:
+    """Les remises à zéro proposées sur ce compte, ou rien du tout — le cas le plus courant.
+
+    Ces blocs viennent d'expériences en cours : un champ peut manquer ou changer de type d'une
+    semaine à l'autre. Comme Claude Code, on ignore ce qui ne se lit pas plutôt que d'échouer.
+    Un compte déclaré inéligible n'affiche rien : l'offre ne le concerne pas.
+    """
+    found: list[Refill] = []
+    session = data.get(SESSION_RESET_KEY) if isinstance(data.get(SESSION_RESET_KEY), dict) else {}
+    if session.get("eligible"):
+        found.append(
+            Refill(
+                label="reset de session",
+                is_available=bool(session.get("available")),
+                total=_whole(session.get("resets_per_week"), 1),
+                available_at=parse_ts(session.get("next_available_at")),
+            )
+        )
+    grants = data.get(GRANTS_KEY) if isinstance(data.get(GRANTS_KEY), dict) else {}
+    if not grants.get("eligible"):
+        return tuple(found)
+    # Une temporisation vaut pour tout le bloc : aucune recharge n'est utilisable avant.
+    cooldown = parse_ts(grants.get("cooldown_until"))
+    for grant in grants.get("grants") or []:
+        if not isinstance(grant, dict) or grant.get("paused"):
+            continue
+        left = _whole(grant.get("resets_left"))
+        if not left or left <= 0:
+            continue
+        starts_at = parse_ts(grant.get("starts_at"))
+        waiting = cooldown or (starts_at if starts_at and starts_at > now() else None)
+        found.append(
+            Refill(
+                label=str(grant.get("label") or "recharge"),
+                is_available=bool(grant.get("usable_now")) and waiting is None,
+                left=left,
+                total=_whole(grant.get("resets_total")) or None,
+                available_at=waiting,
+                ends_at=parse_ts(grant.get("ends_at")),
+                needs_limit=bool(grant.get("use_requires_limit", True)),
+            )
+        )
+    return tuple(found)
 
 
 def _breakdown(data: dict) -> tuple[tuple[str, float], ...]:
@@ -290,20 +356,10 @@ def plan_from_org(org: dict) -> str:
 
 def is_chat_org(org: dict) -> bool:
     """Les orgs API-only n'ont pas de session 5 h / semaine d'abonnement."""
-    caps = org.get("capabilities") or []
-    return "chat" in caps
+    return "chat" in (org.get("capabilities") or [])
 
 
-def org_label(name: str, plan: str) -> str:
-    """Nom d'affichage : raccourcit l'org perso, et porte toujours le plan à côté."""
-    if "'s Organization" in name or "’s Organization" in name or "'s Individual Org" in name:
-        short = "Perso"
-    else:
-        short = name or "Organisation"
-    return f"{short} · {plan}" if plan else short
-
-
-def _memberships(account: dict | None, active_id: str, email: str, account_name: str) -> list[tuple[str, str, str]]:
+def _memberships(account: dict | None, active_id: str) -> list[tuple[str, str, str]]:
     """(org_id, org_name, plan) pour chaque org chat, active en premier."""
     rows: list[tuple[str, str, str]] = []
     seen: set[str] = set()
@@ -317,79 +373,52 @@ def _memberships(account: dict | None, active_id: str, email: str, account_name:
         if not org_id or org_id in seen:
             continue
         seen.add(org_id)
-        name = str(org.get("name") or "")
-        plan = plan_from_org(org) or "Claude"
-        rows.append((org_id, name, plan))
+        rows.append((org_id, str(org.get("name") or ""), plan_from_org(org) or "Claude"))
     rows.sort(key=lambda row: (0 if row[0] == active_id else 1, row[1].lower()))
     if active_id and active_id not in seen:
         rows.insert(0, (active_id, "", ""))
     return rows
 
 
-def _build_orgs(
-    account_payload: dict | None,
-    active: Account | None,
-    session: Window | None,
-    weekly: Window | None,
-    scoped: tuple[Window, ...],
-    extra: Extra | None,
-    breakdown: tuple[tuple[str, float], ...],
-    fetched_at,
-) -> tuple[OrgView, ...]:
-    email = active.email if active else ""
-    account_name = active.name if active else ""
+def _views(account_payload: dict | None, active: Account | None, live: AccountView | None) -> tuple[AccountView, ...]:
+    """Une vue par organisation : celle du token en direct, les autres depuis le cache."""
     active_id = active.org_id if active else ""
-    views: list[OrgView] = []
-    for org_id, org_name, plan in _memberships(account_payload, active_id, email, account_name):
-        if org_id == active_id and active and fetched_at is not None:
-            view = OrgView(
-                org_id=org_id,
-                org_name=active.org_name or org_name,
-                plan=active.plan or plan,
+    email = active.email if active else ""
+    memberships = _memberships(account_payload, active_id)
+    if not memberships and (active_id or live is not None):
+        # Le profil peut rater alors que l'usage a répondu : on montre quand même les chiffres.
+        memberships = [(active_id, active.org_name if active else "", active.plan if active else "")]
+    views: list[AccountView] = []
+    for org_id, org_name, plan in memberships:
+        if org_id == active_id and live is not None:
+            view = AccountView(
+                key=org_id,
+                name=(active.org_name if active else "") or org_name,
+                plan=(active.plan if active else "") or plan,
                 email=email,
-                account_name=account_name,
                 is_active=True,
-                session=session,
-                weekly=weekly,
-                scoped=scoped,
-                extra=extra,
-                breakdown=breakdown,
-                fetched_at=fetched_at,
+                session=live.session,
+                weekly=live.weekly,
+                scoped=live.scoped,
+                extra=live.extra,
+                refills=live.refills,
+                breakdown=live.breakdown,
+                fetched_at=live.fetched_at,
             )
-            remember_org(view)
-            views.append(view)
-        elif org_id == active_id and active:
-            # Usage injoignable : on affiche le dernier cache, marqué actif.
-            view = cached_org(org_id, active.org_name or org_name, active.plan or plan, email, account_name)
-            views.append(
-                OrgView(
-                    org_id=view.org_id,
-                    org_name=view.org_name,
-                    plan=view.plan,
-                    email=view.email,
-                    account_name=view.account_name,
-                    is_active=True,
-                    session=view.session,
-                    weekly=view.weekly,
-                    scoped=view.scoped,
-                    extra=view.extra,
-                    breakdown=view.breakdown,
-                    fetched_at=view.fetched_at,
-                )
-            )
+            remember_account_view(view)
         else:
-            views.append(cached_org(org_id, org_name, plan, email, account_name))
+            view = cached_account_view(org_id, org_name, plan, email, is_active=org_id == active_id)
+        views.append(view)
     return tuple(views)
 
 
 def fetch() -> Snapshot:
-    origin = ""
+    """Une lecture complète du compte Claude. `attempted_at` est posé même quand tout rate."""
     cached = cached_account()
-    token = ""
     try:
         token, origin = read_token()
     except ClaudeError as exc:
-        return Snapshot(account=cached, error=str(exc), token_origin=origin, retry_after=exc.retry_after)
+        return Snapshot(account=cached, error=str(exc), attempted_at=now(), retry_after=exc.retry_after)
 
     usage = None
     usage_error = ""
@@ -400,8 +429,6 @@ def fetch() -> Snapshot:
         usage_error = str(exc)
         retry_after = exc.retry_after
 
-    profile = None
-    account_payload = None
     try:
         profile = _get(PROFILE_URL, token)
     except ClaudeError:
@@ -412,48 +439,39 @@ def fetch() -> Snapshot:
         account_payload = None
 
     account = _account(profile, cached)
-    if account and account_payload and isinstance(account_payload, dict):
-        email = str(account_payload.get("email_address") or account.email)
-        name = str(account_payload.get("full_name") or account_payload.get("display_name") or account.name)
+    if account and isinstance(account_payload, dict):
         account = Account(
-            name=name,
-            email=email,
+            name=str(account_payload.get("full_name") or account_payload.get("display_name") or account.name),
+            email=str(account_payload.get("email_address") or account.email),
             plan=account.plan,
             org_id=account.org_id,
             org_name=account.org_name,
         )
 
-    session = weekly = None
-    scoped_tuple: tuple[Window, ...] = ()
-    extra = None
-    breakdown: tuple[tuple[str, float], ...] = ()
-    fetched_at = None
+    live = None
     if usage is not None:
         session, weekly, scoped = _from_limits(usage)
         if session is None and weekly is None:
-            session, weekly, scoped = _from_legacy(usage)
-        scoped_tuple = tuple(scoped)
-        extra = _extra(usage)
-        breakdown = _breakdown(usage)
-        fetched_at = now()
+            session, weekly, legacy_scoped = _from_legacy(usage)
+            scoped = scoped or legacy_scoped
+        live = AccountView(
+            key=account.org_id if account else "",
+            session=session,
+            weekly=weekly,
+            scoped=tuple(scoped),
+            extra=_extra(usage),
+            refills=_refills(usage),
+            breakdown=_breakdown(usage),
+            fetched_at=now(),
+        )
 
-    orgs = _build_orgs(account_payload, account, session, weekly, scoped_tuple, extra, breakdown, fetched_at)
-    # Si l'usage a raté mais qu'on a un cache pour l'org active, on remplit le snapshot dessus.
-    if fetched_at is None:
-        for org in orgs:
-            if org.is_active and (org.session or org.weekly):
-                session, weekly, scoped_tuple = org.session, org.weekly, org.scoped
-                extra, breakdown, fetched_at = org.extra, org.breakdown, org.fetched_at
-                break
+    views = _views(account_payload, account, live)
+    active = next((view for view in views if view.is_active), None)
     return Snapshot(
         account=account,
-        session=session,
-        weekly=weekly,
-        scoped=scoped_tuple,
-        extra=extra,
-        breakdown=breakdown,
-        orgs=orgs,
-        fetched_at=fetched_at,
+        views=views,
+        fetched_at=active.fetched_at if active else None,
+        attempted_at=now(),
         error=usage_error,
         token_origin=origin,
         retry_after=retry_after,

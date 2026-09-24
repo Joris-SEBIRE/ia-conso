@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import traceback
+from dataclasses import replace
 
 import objc
 from Cocoa import (
@@ -49,20 +50,39 @@ from PyObjCTools import AppHelper
 from . import IDENTITY_TINT, launchagent, shortcuts
 from . import help as manual
 from .activity import Activity, probe as probe_activity
-from .anthropic import fetch, org_label
+from .anthropic import fetch as fetch_claude
 from .avatars import Avatars
-from .config import CONFIG_PATH, Config
-from .cursor import fetch_cursor
-from .formatting import age_seconds, countdown, freshness_label, freshness_tint, money, percent, reset_bits, spell, tint_for
-from .models import CursorView, Extra, OrgView, Snapshot, Window, now
+from .config import Config
+from .cursor import fetch as fetch_cursor
+from .formatting import (
+    DISABLED_REASONS,
+    account_title,
+    activity_bits,
+    age_seconds,
+    amounts,
+    countdown,
+    extra_bits,
+    freshness_label,
+    freshness_tint,
+    model_tint,
+    percent,
+    refill_line,
+    reset_bits,
+    tint_for,
+)
+from .models import CLAUDE, CURSOR, AccountView, Extra, Snapshot, Window, now
+from .paths import CONFIG_PATH
 from .state import acquire_single_instance, log_error, write_status
 
 BUNDLE_ID = "fr.jsebire.ia-conso"
 # Tick UI + sondage local. 0,5 s : on remarque la fin d'un run dès que Cursor écrit sa DB.
 TICK_SECONDS = 0.5
 ACTIVITY_PROBE_SECONDS = 1.0
-STUCK_AFTER = 30.0
+# Au-dessus de la somme des délais réseau d'un cycle (trousseau 10 s + 5 appels à 8 s).
+STUCK_AFTER = 90.0
 FROZEN_AFTER = 180.0
+# Après un échec, on attend au moins ça avant de retenter, même sans Retry-After.
+RETRY_FLOOR = 30
 RING_SIZE = 22.0
 RING_WIDTH = 1.75
 RING_TRACK_ALPHA = 0.28
@@ -84,17 +104,20 @@ BAR_WIDTH = 12
 SHORTCUT_MIN = 84.0
 # « 100 % » : largeur fixe pour aligner les jauges d'un compte à l'autre.
 PERCENT_FIELD = 5
-PERCENT_PAD = "\u2007"  # figure space = largeur d'un chiffre
+PERCENT_PAD = " "  # figure space = largeur d'un chiffre
 BAR_GAP = "  "
 BAR_BASELINE = (HERO_FONT - META_FONT) * 0.35
+ACTIVITY_TITLE_MAX = 42
+ACTIVITY_SEP = "  ·  "
+# L'effort reprend la couleur du modèle, en retrait : il la précise, il ne la concurrence pas.
+EFFORT_ALPHA = 0.75
 
 _LABELS: dict[tuple, object] = {}
+_CHROME: dict[tuple, object] = {}
 
 
 def _colour(name: str):
-    if name == "IDENTITY":
-        name = IDENTITY_TINT
-    return getattr(NSColor, name)()
+    return getattr(NSColor, IDENTITY_TINT if name == "IDENTITY" else name)()
 
 
 def _paragraph(before: float = 0.0, after: float = 1.0):
@@ -110,11 +133,7 @@ def _run(text: str, size: float, color=None, weight=None, paragraph=None, mono: 
         NSFontAttributeName: (
             NSFont.monospacedDigitSystemFontOfSize_weight_(size, weight or NSFontWeightSemibold)
             if mono
-            else (
-                NSFont.systemFontOfSize_(size)
-                if weight is None
-                else NSFont.systemFontOfSize_weight_(size, weight)
-            )
+            else (NSFont.systemFontOfSize_(size) if weight is None else NSFont.systemFontOfSize_weight_(size, weight))
         )
     }
     if color is not None:
@@ -139,18 +158,15 @@ def _meter_title(label: str, value: float | None, detail: str, reset: str = "", 
     """Bloc commun : libellé + reset, puis « N %  ████ » teintés comme l'icône."""
     tint = _colour(tint_for(value))
     grey = NSColor.secondaryLabelColor()
-    identity = _colour(IDENTITY_TINT)
     text = NSMutableAttributedString.alloc().init()
     text.appendAttributedString_(
         _run(label.upper(), HEADER_FONT, color=tint, weight=NSFontWeightSemibold, paragraph=_paragraph())
     )
     if reset:
-        text.appendAttributedString_(
-            _run(f"  ·  {reset}", META_FONT, color=grey, weight=NSFontWeightMedium)
-        )
+        text.appendAttributedString_(_run(f"  ·  {reset}", META_FONT, color=grey, weight=NSFontWeightMedium))
     if when:
         text.appendAttributedString_(
-            _run(f" · {when}", META_FONT, color=identity, weight=NSFontWeightSemibold)
+            _run(f" · {when}", META_FONT, color=_colour(IDENTITY_TINT), weight=NSFontWeightSemibold)
         )
     text.appendAttributedString_(
         _run(
@@ -175,83 +191,81 @@ def _meter_title(label: str, value: float | None, detail: str, reset: str = "", 
         )
     if detail:
         text.appendAttributedString_(
-            _run(
-                f"  ·  {detail}",
-                META_FONT,
-                color=grey,
-                weight=NSFontWeightMedium,
-                baseline=BAR_BASELINE,
-            )
+            _run(f"  ·  {detail}", META_FONT, color=grey, weight=NSFontWeightMedium, baseline=BAR_BASELINE)
         )
     return text
 
 
 def _window_title(window: Window):
     reset, when = reset_bits(window.resets_at, is_session=window.is_session)
-    return _meter_title(window.label, window.percent, "", reset, when)
+    return _meter_title(window.label, window.percent, amounts(window.used, window.cap, window.currency), reset, when)
 
 
 def _extra_title(extra: Extra):
-    detail = f"{money(extra.used, extra.currency)} / {money(extra.cap, extra.currency)}"
+    detail = amounts(extra.used, extra.cap, extra.currency) if extra.cap else ""
     if not extra.is_enabled:
-        why = {
-            "out_of_credits": "crédits épuisés",
-            "user_disabled": "désactivé manuellement",
-        }.get(extra.disabled_reason, "désactivé")
-        detail = f"{detail} · {why}"
-    value = extra.percent if extra.percent is not None else (
-        (100.0 * extra.used / extra.cap) if extra.cap else 0.0
-    )
-    reset, when = (("reset mensuel", "") if extra.resets_at is None else reset_bits(extra.resets_at))
+        why = DISABLED_REASONS.get(extra.disabled_reason, "désactivé")
+        detail = f"{detail} · {why}" if detail else why
+    value = extra.percent
+    if value is None:
+        value = (100.0 * extra.used / extra.cap) if extra.cap else None
+    reset, when = extra_bits(extra)
     return _meter_title("extra", value, detail, reset, when)
 
 
-ACTIVITY_TITLE_MAX = 42
+def _refill_title(refill):
+    """Une remise à zéro proposée par Claude Code, mise en avant seulement si elle est utilisable."""
+    tint = _colour(IDENTITY_TINT) if refill.is_available else NSColor.secondaryLabelColor()
+    weight = NSFontWeightSemibold if refill.is_available else NSFontWeightMedium
+    text = NSMutableAttributedString.alloc().init()
+    text.appendAttributedString_(_run("↺  ", META_FONT, color=tint, weight=weight))
+    text.appendAttributedString_(_run(refill_line(refill), META_FONT, color=tint, weight=weight))
+    return text
 
 
-def _crop_activity_title(title: str) -> str:
+def _crop(title: str) -> str:
     text = (title or "").strip() or "session"
-    if len(text) <= ACTIVITY_TITLE_MAX:
-        return text
-    return text[: ACTIVITY_TITLE_MAX - 1].rstrip() + "…"
+    return text if len(text) <= ACTIVITY_TITLE_MAX else text[: ACTIVITY_TITLE_MAX - 1].rstrip() + "…"
 
 
-def _append_activity(text, rows) -> None:
-    """Lignes : `+ titre : en cours · depuis …` / `- titre : en attente de réponse · depuis …`.
+def _activity_style(role: str, item) -> tuple:
+    """(couleur, graisse) d'un morceau de ligne d'activité.
 
-    Une ligne bloquée (−) s'ajoute à la ligne en cours (+), elle ne la remplace pas.
+    Le modèle porte la couleur de sa famille et l'effort la reprend, en retrait : les deux se
+    lisent ensemble. Tout ce qui décrit l'avancement passe en gris, pour ne pas concurrencer la
+    seule information qu'on cherche de loin — sur quoi tourne cette session.
     """
-    if not rows:
+    if role == "alert":
+        return _colour("systemRedColor"), NSFontWeightSemibold
+    if role == "title":
+        return _colour("systemRedColor" if item.is_waiting else IDENTITY_TINT), NSFontWeightSemibold
+    if role == "model":
+        return _colour(model_tint(item.model)), NSFontWeightSemibold
+    if role == "effort":
+        return _colour(model_tint(item.model)).colorWithAlphaComponent_(EFFORT_ALPHA), NSFontWeightMedium
+    return NSColor.secondaryLabelColor(), NSFontWeightMedium
+
+
+def _append_activity(text, items) -> None:
+    """Une ligne par session : son titre, le modèle et l'effort, puis son avancement en gris."""
+    if not items:
         return
     now_ms = int(time.time() * 1000)
-    for index, row in enumerate(rows):
-        title, is_waiting, since_ms = row[0], row[1], row[2] if len(row) > 2 else 0
-        tint = "systemRedColor" if is_waiting else IDENTITY_TINT
-        mark = "→ "
-        status = "en attente de réponse" if is_waiting else "en cours"
-        label = f"{mark}{_crop_activity_title(title)} : {status}"
-        if since_ms:
-            elapsed = max(0, (now_ms - int(since_ms)) // 1000)
-            duration = spell(elapsed)
-            if duration:
-                label = f"{label} · depuis {duration}"
+    for index, item in enumerate(items):
+        arrow = _colour("systemRedColor" if item.is_waiting else IDENTITY_TINT)
         text.appendAttributedString_(
-            _run(
-                "\n",
-                META_FONT,
-                color=_colour(tint),
-                weight=NSFontWeightSemibold,
-                paragraph=_paragraph(before=2.0 if index == 0 else 1.0),
-            )
+            _run("\n", META_FONT, paragraph=_paragraph(before=2.0 if index == 0 else 1.0))
         )
-        text.appendAttributedString_(
-            _run(
-                label,
-                META_FONT,
-                color=_colour(tint),
-                weight=NSFontWeightSemibold,
+        text.appendAttributedString_(_run("→ ", META_FONT, color=arrow, weight=NSFontWeightSemibold))
+        for position, (role, raw) in enumerate(activity_bits(item, now_ms)):
+            if position:
+                text.appendAttributedString_(
+                    _run(ACTIVITY_SEP, META_FONT, color=NSColor.tertiaryLabelColor(), weight=NSFontWeightMedium)
+                )
+            colour, weight = _activity_style(role, item)
+            text.appendAttributedString_(
+                _run(_crop(raw) if role == "title" else raw, META_FONT, color=colour, weight=weight)
             )
-        )
 
 
 def _count_pill(count: str, tint: str):
@@ -309,116 +323,66 @@ def _with_counts(face, waiting: str, running: str):
     return canvas
 
 
-def _cursor_header(view: CursorView, activity_rows=()):
+def _account_header(view: AccountView, items=()):
+    """En-tête d'un compte, Claude ou Cursor : titre, fraîcheur, e-mail, puis son activité."""
     grey = NSColor.secondaryLabelColor()
-    title = view.plan or "Cursor"
-    freshness = freshness_label(True, view.fetched_at)
-    age_tint = _colour(freshness_tint(age_seconds(view.fetched_at)))
+    tint = _colour(IDENTITY_TINT) if view.is_active else grey
+    age_tint = _colour(freshness_tint(age_seconds(view.fetched_at))) if view.is_active else grey
     text = NSMutableAttributedString.alloc().init()
     text.appendAttributedString_(
-        _run(title, TITLE_FONT, color=_colour(IDENTITY_TINT), weight=NSFontWeightSemibold, paragraph=_paragraph())
-    )
-    text.appendAttributedString_(_run("  ·  ", TITLE_FONT, color=grey, weight=NSFontWeightSemibold))
-    text.appendAttributedString_(_run(freshness, TITLE_FONT, color=age_tint, weight=NSFontWeightMedium))
-    if view.email:
-        text.appendAttributedString_(
-            _run(f"\n{view.email}", META_FONT, color=grey, paragraph=_paragraph(before=1.0))
-        )
-    _append_activity(text, activity_rows)
-    return text
-
-
-def _cursor_period_title(view: CursorView):
-    if view.period is None:
-        return None
-    detail = ""
-    if view.cap:
-        detail = f"{money(view.used, view.currency)} / {money(view.cap, view.currency)}"
-    reset, when = reset_bits(view.period.resets_at)
-    return _meter_title(view.period.label, view.period.percent, detail, reset, when)
-
-
-def _account_header(org: OrgView, activity_rows=()):
-    grey = NSColor.secondaryLabelColor()
-    title = org_label(org.org_name, org.plan)
-    # Le plan est déjà dans le titre : en dessous, seulement l'email.
-    meta = org.email or ""
-    freshness = freshness_label(org.is_active, org.fetched_at)
-    if org.is_active:
-        name_tint = _colour(IDENTITY_TINT)
-        age_tint = _colour(freshness_tint(age_seconds(org.fetched_at)))
-    else:
-        name_tint = grey
-        age_tint = grey
-    text = NSMutableAttributedString.alloc().init()
-    text.appendAttributedString_(
-        _run(title, TITLE_FONT, color=name_tint, weight=NSFontWeightSemibold, paragraph=_paragraph())
-    )
-    text.appendAttributedString_(_run("  ·  ", TITLE_FONT, color=grey, weight=NSFontWeightSemibold))
-    text.appendAttributedString_(_run(freshness, TITLE_FONT, color=age_tint, weight=NSFontWeightMedium))
-    if meta:
-        text.appendAttributedString_(
-            _run(f"\n{meta}", META_FONT, color=grey, paragraph=_paragraph(before=1.0))
-        )
-    _append_activity(text, activity_rows)
-    return text
-
-
-def _flat_account_header(snap: Snapshot, activity_rows=()):
-    who = snap.account
-    label = org_label(who.org_name, who.plan) if who.org_name else (who.name or who.email)
-    meta = who.email or ""
-    freshness = freshness_label(True, snap.fetched_at)
-    header = NSMutableAttributedString.alloc().init()
-    header.appendAttributedString_(
-        _run(label, TITLE_FONT, color=_colour(IDENTITY_TINT), weight=NSFontWeightSemibold, paragraph=_paragraph())
-    )
-    header.appendAttributedString_(_run("  ·  ", TITLE_FONT, color=NSColor.secondaryLabelColor()))
-    header.appendAttributedString_(
         _run(
-            freshness,
+            account_title(view.name, view.plan),
             TITLE_FONT,
-            color=_colour(freshness_tint(age_seconds(snap.fetched_at))),
+            color=tint,
+            weight=NSFontWeightSemibold,
+            paragraph=_paragraph(),
+        )
+    )
+    text.appendAttributedString_(_run("  ·  ", TITLE_FONT, color=grey, weight=NSFontWeightSemibold))
+    text.appendAttributedString_(
+        _run(freshness_label(view.is_active, view.fetched_at), TITLE_FONT, color=age_tint, weight=NSFontWeightMedium)
+    )
+    if view.email:
+        text.appendAttributedString_(_run(f"\n{view.email}", META_FONT, color=grey, paragraph=_paragraph(before=1.0)))
+    _append_activity(text, items)
+    return text
+
+
+def _account_summary(view: AccountView):
+    """Compte replié : une ligne de titre, une ligne de chiffres."""
+    grey = NSColor.secondaryLabelColor()
+    text = NSMutableAttributedString.alloc().init()
+    text.appendAttributedString_(
+        _run(
+            account_title(view.name, view.plan),
+            TITLE_FONT,
+            color=None if view.is_active else grey,
+            weight=NSFontWeightSemibold,
+            paragraph=_paragraph(),
+        )
+    )
+    text.appendAttributedString_(_run("  ·  ", TITLE_FONT, color=grey, weight=NSFontWeightSemibold))
+    text.appendAttributedString_(
+        _run(
+            freshness_label(view.is_active, view.fetched_at),
+            TITLE_FONT,
+            color=_colour(freshness_tint(age_seconds(view.fetched_at))) if view.is_active else grey,
             weight=NSFontWeightMedium,
         )
     )
-    if meta:
-        header.appendAttributedString_(
-            _run(f"\n{meta}", META_FONT, color=NSColor.secondaryLabelColor(), paragraph=_paragraph(before=1.0))
-        )
-    _append_activity(header, activity_rows)
-    return header
-
-
-def _org_summary(org: OrgView):
-    grey = NSColor.secondaryLabelColor()
-    title = org_label(org.org_name, org.plan)
-    freshness = freshness_label(org.is_active, org.fetched_at)
-    name_tint = None if org.is_active else grey
-    age_tint = (
-        _colour(freshness_tint(age_seconds(org.fetched_at))) if org.is_active else grey
-    )
-    text = NSMutableAttributedString.alloc().init()
-    text.appendAttributedString_(
-        _run(title, TITLE_FONT, color=name_tint, weight=NSFontWeightSemibold, paragraph=_paragraph())
-    )
-    text.appendAttributedString_(_run("  ·  ", TITLE_FONT, color=grey, weight=NSFontWeightSemibold))
-    text.appendAttributedString_(_run(freshness, TITLE_FONT, color=age_tint, weight=NSFontWeightMedium))
     bits = []
-    if org.session:
-        bits.append((f"session {percent(org.session.percent)}", tint_for(org.session.percent)))
-    if org.weekly:
-        bits.append((f"semaine {percent(org.weekly.percent)}", tint_for(org.weekly.percent)))
-    if org.extra and org.extra.cap:
-        bits.append((f"extra {percent(org.extra.percent)}", tint_for(org.extra.percent)))
+    if view.session:
+        bits.append((f"{view.session.label} {percent(view.session.percent)}", tint_for(view.session.percent)))
+    if view.weekly:
+        bits.append((f"semaine {percent(view.weekly.percent)}", tint_for(view.weekly.percent)))
+    if view.extra and view.extra.cap:
+        bits.append((f"extra {percent(view.extra.percent)}", tint_for(view.extra.percent)))
     if bits:
         text.appendAttributedString_(_run("\n", TITLE_FONT, paragraph=_paragraph(before=2.0)))
         for index, (label, bit_tint) in enumerate(bits):
             if index:
                 text.appendAttributedString_(_run("  ·  ", TITLE_FONT, color=grey, weight=NSFontWeightMedium))
-            text.appendAttributedString_(
-                _run(label, TITLE_FONT, color=_colour(bit_tint), weight=NSFontWeightMedium)
-            )
+            text.appendAttributedString_(_run(label, TITLE_FONT, color=_colour(bit_tint), weight=NSFontWeightMedium))
     return text
 
 
@@ -462,24 +426,18 @@ def _chrome_symbol(name: str, tint: str = ""):
     return canvas
 
 
-_CHROME: dict = {}
-
-
 def _face(avatars: Avatars, email: str, fallback: str = "person.crop.circle", tint: str = IDENTITY_TINT):
     photo = avatars.image(email, AVATAR_SIZE)
-    if photo is not None:
-        # Même marge de gauche que les glyphes chrome, pour aligner les textes.
-        canvas = NSImage.alloc().initWithSize_(NSMakeSize(AVATAR_SIZE + LEFT_MARGIN, AVATAR_SIZE))
-        canvas.lockFocus()
-        photo.drawInRect_fromRect_operation_fraction_(
-            NSMakeRect(LEFT_MARGIN, 0, AVATAR_SIZE, AVATAR_SIZE),
-            NSZeroRect,
-            NSCompositingOperationSourceOver,
-            1.0,
-        )
-        canvas.unlockFocus()
-        return canvas
-    return _chrome_symbol(fallback, tint)
+    if photo is None:
+        return _chrome_symbol(fallback, tint)
+    # Même marge de gauche que les glyphes chrome, pour aligner les textes.
+    canvas = NSImage.alloc().initWithSize_(NSMakeSize(AVATAR_SIZE + LEFT_MARGIN, AVATAR_SIZE))
+    canvas.lockFocus()
+    photo.drawInRect_fromRect_operation_fraction_(
+        NSMakeRect(LEFT_MARGIN, 0, AVATAR_SIZE, AVATAR_SIZE), NSZeroRect, NSCompositingOperationSourceOver, 1.0
+    )
+    canvas.unlockFocus()
+    return canvas
 
 
 def _fit_label(label: str, tint, room: float):
@@ -499,12 +457,7 @@ def _fit_label(label: str, tint, room: float):
     return drawn, box
 
 
-def _badge(
-    session_percent: float | None,
-    weekly_percent: float | None,
-    waiting: int = 0,
-    running: int = 0,
-) -> object:
+def _badge(session_percent: float | None, weekly_percent: float | None, waiting: int = 0, running: int = 0):
     """Chiffre = session 5 h ; anneau = semaine ; pastilles = attente (rouge) / en cours (identité)."""
     size = RING_SIZE
     canvas = NSImage.alloc().initWithSize_(NSMakeSize(size, size))
@@ -538,11 +491,7 @@ def _badge(
 
     NSApplication.sharedApplication().effectiveAppearance().performAsCurrentDrawingAppearance_(paint)
     canvas.setTemplate_(False)
-    return _with_counts(
-        canvas,
-        str(waiting) if waiting else "",
-        str(running) if running else "",
-    )
+    return _with_counts(canvas, str(waiting) if waiting else "", str(running) if running else "")
 
 
 def _spinner_image(frame: str):
@@ -575,19 +524,20 @@ class IAConsoApp(NSObject):
         self.cfg_mtime = self.config_mtime()
         self.snapshot = Snapshot()
         self.activity = Activity()
-        self.activity_headers = []
+        self.activity_rows = []
         self.activity_stop = threading.Event()
         self.avatars = Avatars()
         self.fetching = False
         self.fetch_started = None
         self.fetch_epoch = 0
-        self.fetch_local = threading.local()
         self.menu_open = False
         self.shown = None
+        self.status_written = None
         self.footer_item = None
         self.footer_rows = []
         self.footer_active = []
         self.shortcut_row = None
+        self.timer = None
         self.hover_timer = None
         self.help_window = None
         self.show_spinner = False
@@ -612,7 +562,7 @@ class IAConsoApp(NSObject):
             self, "wake:", "NSWorkspaceDidWakeNotification", None
         )
         threading.Thread(target=self._activity_loop, name="ia-conso-activity", daemon=True).start()
-        self.start_fetch()
+        self.start_fetch(force=True)
 
     @objc.python_method
     def _activity_loop(self) -> None:
@@ -624,9 +574,7 @@ class IAConsoApp(NSObject):
                 log_error(f"activité : {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
                 activity = None
             if activity is not None:
-                self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                    "applyActivity:", activity, False
-                )
+                self.performSelectorOnMainThread_withObject_waitUntilDone_("applyActivity:", activity, False)
             self.activity_stop.wait(ACTIVITY_PROBE_SECONDS)
 
     def applyActivity_(self, activity) -> None:
@@ -642,6 +590,9 @@ class IAConsoApp(NSObject):
             log_error("cycle bloqué au-delà du délai : drapeau relâché de force")
             self.fetch_epoch += 1
             self.fetching = False
+            # Sans redater la tentative, le compte à rebours reste à zéro et un cycle repart aussitôt.
+            self.snapshot = replace(self.snapshot, attempted_at=now(), error="cycle interrompu")
+            self.stop_spinner()
         if self.menu_open:
             if self.contents() != self.shown:
                 self.build_menu(self.menu)
@@ -706,15 +657,21 @@ class IAConsoApp(NSObject):
 
     @objc.python_method
     def interval(self) -> int:
+        """Rythme du prochain cycle : le sien, ou celui qu'Anthropic impose après un 429."""
+        base = max(15, self.cfg.refresh_seconds)
         if self.snapshot.retry_after:
-            return max(self.cfg.refresh_seconds, self.snapshot.retry_after)
-        return max(15, self.cfg.refresh_seconds)
+            return max(base, self.snapshot.retry_after)
+        if self.snapshot.error:
+            # Un échec ne doit pas relancer un cycle à chaque tick : c'est ce qui entretient un 429.
+            return max(base, RETRY_FLOOR)
+        return base
 
     @objc.python_method
     def countdown(self) -> int:
-        if self.snapshot.fetched_at is None:
-            return 0 if not self.fetching else self.interval()
-        elapsed = (now() - self.snapshot.fetched_at).total_seconds()
+        """Temps avant la prochaine tentative, comptée depuis la dernière — réussie ou non."""
+        if self.snapshot.attempted_at is None:
+            return 0
+        elapsed = (now() - self.snapshot.attempted_at).total_seconds()
         return max(0, int(self.interval() - elapsed))
 
     @objc.python_method
@@ -733,45 +690,49 @@ class IAConsoApp(NSObject):
         self.fetching = True
         self.fetch_started = now()
         self.fetch_epoch += 1
-        self.start_spinner()
+        # Le spinner remplace le badge : il ne le fait que pour une attente demandée, ou la première.
+        if force or self.snapshot.fetched_at is None:
+            self.start_spinner()
         threading.Thread(target=self._fetch_worker, args=(self.fetch_epoch,), daemon=True).start()
 
     @objc.python_method
     def _fetch_worker(self, epoch: int) -> None:
-        self.fetch_local.epoch = epoch
         try:
-            snapshot = fetch()
+            snapshot = fetch_claude()
+            if epoch != self.fetch_epoch:
+                # Un cycle plus récent a pris la main : inutile d'aller plus loin.
+                return
             cursor = fetch_cursor()
             snapshot = Snapshot(
                 account=snapshot.account,
-                session=snapshot.session,
-                weekly=snapshot.weekly,
-                scoped=snapshot.scoped,
-                extra=snapshot.extra,
-                breakdown=snapshot.breakdown,
-                orgs=snapshot.orgs,
-                cursor=cursor,
+                views=snapshot.views + (cursor,),
                 fetched_at=snapshot.fetched_at,
+                attempted_at=snapshot.attempted_at,
                 error=snapshot.error,
                 token_origin=snapshot.token_origin,
                 retry_after=snapshot.retry_after,
             )
-            emails = {org.email for org in snapshot.orgs if org.email}
+            self.land(epoch, self.apply_snapshot, snapshot)
+            emails = {view.email for view in snapshot.views if view.email}
             if snapshot.account and snapshot.account.email:
                 emails.add(snapshot.account.email)
-            if cursor and cursor.email:
-                emails.add(cursor.email)
-            self.avatars.prefetch(emails)
-            self.land(self.apply_snapshot, snapshot)
+            try:
+                self.avatars.prefetch(emails)
+            except Exception as exc:
+                # Les chiffres sont déjà affichés : une panne de photo ne doit pas coûter le cycle.
+                log_error(f"photos : {type(exc).__name__}: {exc}")
+            else:
+                # Une photo arrivée après coup ne se voit qu'au rendu suivant : on le redemande.
+                self.land(epoch, self.apply_snapshot, snapshot)
         except Exception as exc:
             log_error(f"cycle interrompu : {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
-            self.land(self.apply_snapshot, Snapshot(error=f"{type(exc).__name__}: {exc}"))
+            self.land(epoch, self.apply_snapshot, Snapshot(error=f"{type(exc).__name__}: {exc}", attempted_at=now()))
         finally:
-            self.land(self.release_fetch)
+            self.land(epoch, self.release_fetch)
 
     @objc.python_method
-    def land(self, apply, *args) -> None:
-        epoch = getattr(self.fetch_local, "epoch", 0)
+    def land(self, epoch: int, apply, *args) -> None:
+        """Repasse sur le thread UI, sauf si un cycle plus récent a déjà pris la main."""
 
         def deliver() -> None:
             if epoch == self.fetch_epoch:
@@ -784,17 +745,14 @@ class IAConsoApp(NSObject):
 
     @objc.python_method
     def apply_snapshot(self, snapshot: Snapshot) -> None:
-        if snapshot.error and self.snapshot.session is not None and snapshot.session is None:
+        if snapshot.error and not snapshot.of(CLAUDE) and self.snapshot.of(CLAUDE):
+            # Claude n'a rien rendu : on garde ses chiffres précédents et la vue Cursor du cycle,
+            # et on date la tentative pour que le prochain cycle respecte son palier.
             snapshot = Snapshot(
                 account=snapshot.account or self.snapshot.account,
-                session=self.snapshot.session,
-                weekly=self.snapshot.weekly,
-                scoped=self.snapshot.scoped,
-                extra=self.snapshot.extra,
-                breakdown=self.snapshot.breakdown,
-                orgs=snapshot.orgs or self.snapshot.orgs,
-                cursor=snapshot.cursor if snapshot.cursor is not None else self.snapshot.cursor,
+                views=self.snapshot.of(CLAUDE) + snapshot.of(CURSOR),
                 fetched_at=self.snapshot.fetched_at,
+                attempted_at=snapshot.attempted_at or now(),
                 error=snapshot.error,
                 token_origin=snapshot.token_origin or self.snapshot.token_origin,
                 retry_after=snapshot.retry_after,
@@ -848,74 +806,76 @@ class IAConsoApp(NSObject):
     def render(self) -> None:
         if self.status_item is None or self.show_spinner:
             return
-        session = self.snapshot.session
-        weekly = self.snapshot.weekly
+        active = self.snapshot.active
+        session = active.session if active else None
+        weekly = active.weekly if active else None
+        running, waiting = self.activity.running_count, self.activity.waiting_count
         button = self.status_item.button()
         button.setImage_(
-            _badge(
-                session.percent if session else None,
-                weekly.percent if weekly else None,
-                self.activity.waiting_count,
-                self.activity.running_count,
-            )
+            _badge(session.percent if session else None, weekly.percent if weekly else None, waiting, running)
         )
         button.setTitle_("")
+        button.setToolTip_(self.tooltip(session, weekly, running, waiting))
+        self.mirror_status()
+
+    @objc.python_method
+    def tooltip(self, session, weekly, running: int, waiting: int) -> str:
         tips = []
         if session:
             tips.append(f"session {percent(session.percent)}")
         if weekly:
             tips.append(f"semaine {percent(weekly.percent)}")
-        if self.activity.waiting_count:
-            unit = "attente" if self.activity.waiting_count == 1 else "attentes"
-            tips.append(f"{self.activity.waiting_count} {unit}")
-        if self.activity.running_count:
-            unit = "en cours" if self.activity.running_count == 1 else "en cours"
-            tips.append(f"{self.activity.running_count} {unit}")
+        if waiting:
+            tips.append(f"{waiting} en attente")
+        if running:
+            tips.append(f"{running} en cours")
+        if agents := self.activity.agent_count:
+            tips.append(f"{agents} agent" + ("s" if agents > 1 else ""))
         if self.snapshot.error and not tips:
-            tip = f"IA-Conso — {self.snapshot.error}"
-        elif tips:
-            tip = "IA-Conso — " + " · ".join(tips)
-        else:
-            tip = "IA-Conso"
-        button.setToolTip_(tip)
-        write_status(
-            {
-                "session": session.percent if session else None,
-                "weekly": weekly.percent if weekly else None,
-                "account": self.snapshot.account.email if self.snapshot.account else "",
-                "org": self.snapshot.account.org_name if self.snapshot.account else "",
-                "orgs": [
+            return f"IA-Conso — {self.snapshot.error}"
+        return "IA-Conso — " + " · ".join(tips) if tips else "IA-Conso"
+
+    @objc.python_method
+    def mirror_status(self) -> None:
+        """Miroir sur disque, réécrit seulement quand il change (le rendu, lui, passe 2 fois/s)."""
+        status = {
+            "comptes": [
+                {
+                    "cle": view.key,
+                    "fournisseur": view.provider,
+                    "nom": account_title(view.name, view.plan),
+                    "actif": view.is_active,
+                    "session": view.session.percent if view.session else None,
+                    "semaine": view.weekly.percent if view.weekly else None,
+                    "maj": view.fetched_at.isoformat() if view.fetched_at else None,
+                    "erreur": view.error,
+                }
+                for view in self.snapshot.views
+            ],
+            "activite": {
+                "en_cours": self.activity.running_count,
+                "en_attente": self.activity.waiting_count,
+                "sessions": [
                     {
-                        "id": org.org_id,
-                        "name": org.org_name,
-                        "active": org.is_active,
-                        "session": org.session.percent if org.session else None,
-                        "weekly": org.weekly.percent if org.weekly else None,
-                        "maj": org.fetched_at.isoformat() if org.fetched_at else None,
+                        "titre": item.title,
+                        "modele": item.model,
+                        "effort": item.effort,
+                        "agents": item.agents,
+                        "en_attente": item.is_waiting,
                     }
-                    for org in self.snapshot.orgs
+                    for item in self.activity.items
                 ],
-                "error": self.snapshot.error,
-                "maj": self.snapshot.fetched_at.isoformat() if self.snapshot.fetched_at else None,
-            }
-        )
+            },
+            "erreur": self.snapshot.error,
+            "maj": self.snapshot.fetched_at.isoformat() if self.snapshot.fetched_at else None,
+        }
+        if status != self.status_written:
+            self.status_written = status
+            write_status(status)
 
     @objc.python_method
     def contents(self) -> tuple:
-        snap = self.snapshot
-        return (
-            snap.account,
-            snap.session,
-            snap.weekly,
-            snap.scoped,
-            snap.extra,
-            snap.breakdown,
-            snap.orgs,
-            snap.cursor,
-            self.activity,
-            snap.error,
-            launchagent.is_enabled(),
-        )
+        return (self.snapshot.views, self.snapshot.error, self.activity)
 
     @objc.python_method
     def build_menu(self, menu) -> None:
@@ -924,115 +884,78 @@ class IAConsoApp(NSObject):
         snap = self.snapshot
         self.shown = self.contents()
         self.footer_rows, self.footer_active = [], []
-        self.activity_headers = []
+        self.activity_rows = []
         self.shortcut_row = None
 
-        if snap.error and not snap.orgs:
+        if snap.error and not snap.of(CLAUDE):
             self.add_info(menu, snap.error)
+        elif not snap.views:
+            self.add_info(menu, "première lecture en cours…")
 
-        active = next((org for org in snap.orgs if org.is_active), None)
-        others = [org for org in snap.orgs if not org.is_active]
-        # Un inactif en détail maxi ; le reste en résumé.
-        detailed_other = others[:1]
-        summarized = others[1:]
-
-        # Actifs d'abord : Claude branché, puis Cursor ; les inactifs Claude en dessous.
-        claude_rows = self.activity.claude_rows()
-        cursor_rows = self.activity.cursor_rows()
+        claude = snap.of(CLAUDE)
+        active = next((view for view in claude if view.is_active), None)
+        others = [view for view in claude if not view.is_active]
         if active:
-            self.add_org(menu, active, activity_rows=claude_rows)
-        elif snap.account:
-            self.add_flat_account(menu, snap, activity_rows=claude_rows)
+            self.add_account(menu, active, self.activity.claude, live=True)
+        for view in snap.of(CURSOR):
+            self.add_break(menu)
+            self.add_account(menu, view, self.activity.cursor, live=True)
+        # Un compte inactif en détail, le reste replié : le menu reste lisible à 5 comptes.
+        if others:
+            self.add_break(menu)
+            self.add_account(menu, others[0])
+        if others[1:]:
+            self.add_break(menu)
+            for view in others[1:]:
+                self.add_rich(menu, _account_summary(view), image=_face(self.avatars, view.email))
 
-        if snap.cursor is not None:
-            menu.addItem_(NSMenuItem.separatorItem())
-            self.add_cursor(menu, snap.cursor, activity_rows=cursor_rows)
-
-        if detailed_other:
-            menu.addItem_(NSMenuItem.separatorItem())
-            self.add_org(menu, detailed_other[0])
-
-        if summarized:
-            menu.addItem_(NSMenuItem.separatorItem())
-            for org in summarized:
-                self.add_rich(menu, _org_summary(org), image=_face(self.avatars, org.email))
-
-        menu.addItem_(NSMenuItem.separatorItem())
+        self.add_break(menu)
         self.add_footer(menu)
         self.add_shortcuts(menu)
 
     @objc.python_method
-    def add_flat_account(self, menu, snap: Snapshot, activity_rows=()) -> None:
-        who = snap.account
-        header = _flat_account_header(snap, activity_rows)
-        row = self.add_rich(menu, header, image=_face(self.avatars, who.email))
-        if activity_rows:
-            self.activity_headers.append(("flat", row, None))
-        if snap.error:
-            self.add_info(menu, snap.error)
-        if snap.session:
-            self.add_window(menu, snap.session)
-        if snap.weekly:
-            self.add_window(menu, snap.weekly)
-        for window in snap.scoped:
-            self.add_window(menu, window)
-        if snap.extra and snap.extra.cap:
-            self.add_extra(menu, snap.extra)
-        for name, share in snap.breakdown:
+    def add_break(self, menu) -> None:
+        """Un séparateur ne sépare que s'il y a quelque chose au-dessus."""
+        last = menu.itemAtIndex_(menu.numberOfItems() - 1) if menu.numberOfItems() else None
+        if last is not None and not last.isSeparatorItem():
+            menu.addItem_(NSMenuItem.separatorItem())
+
+    @objc.python_method
+    def add_account(self, menu, view: AccountView, items=(), live: bool = False) -> None:
+        """Un compte : son en-tête, ses jauges, ses extra.
+
+        `live` dit que ce compte-là porte l'activité en cours : sans lui, l'en-tête se rafraîchit
+        quand même (la fraîcheur vieillit à chaque tick) mais sans se voir greffer les sessions
+        d'un autre compte.
+        """
+        row = self.add_rich(menu, _account_header(view, items), image=_face(self.avatars, view.email))
+        self.activity_rows.append((row, view, live))
+        if view.error:
+            self.add_info(menu, view.error)
+        for window in (view.session, view.weekly, *view.scoped):
+            if window is not None:
+                self.add_meter(menu, "window", window, _window_title(window))
+        if view.extra:
+            self.add_meter(menu, "extra", view.extra, _extra_title(view.extra))
+        for refill in view.refills:
+            self.add_meter(menu, "refill", refill, _refill_title(refill))
+        for name, share in view.breakdown:
             if share > 0:
                 self.add_info(menu, f"{name}  ·  {percent(share)} de la conso")
+        if not view.has_figures and not view.error:
+            self.add_info(
+                menu,
+                "conso réarmée depuis la dernière lecture : passe sur ce compte une fois"
+                if view.fetched_at
+                else "passe sur ce compte une fois pour capturer la conso",
+            )
 
     @objc.python_method
-    def add_org(self, menu, org: OrgView, activity_rows=()) -> None:
-        row = self.add_rich(menu, _account_header(org, activity_rows), image=_face(self.avatars, org.email))
-        if activity_rows:
-            self.activity_headers.append(("claude", row, org))
-        if org.session:
-            self.add_window(menu, org.session)
-        if org.weekly:
-            self.add_window(menu, org.weekly)
-        for window in org.scoped:
-            self.add_window(menu, window)
-        if org.extra and org.extra.cap:
-            self.add_extra(menu, org.extra)
-        for name, share in org.breakdown:
-            if share > 0:
-                self.add_info(menu, f"{name}  ·  {percent(share)} de la conso")
-        if not org.is_active and not (org.session or org.weekly or org.extra):
-            self.add_info(menu, "passe sur ce compte une fois pour capturer la conso")
-
-    @objc.python_method
-    def add_cursor(self, menu, view: CursorView, activity_rows=()) -> None:
-        row = self.add_rich(menu, _cursor_header(view, activity_rows), image=_face(self.avatars, view.email))
-        if activity_rows:
-            self.activity_headers.append(("cursor", row, view))
-        if view.error and view.period is None:
-            self.add_info(menu, view.error)
-            return
-        title = _cursor_period_title(view)
-        if title is not None:
-            row = NSMenuItem.alloc().init()
-            row.setAttributedTitle_(title)
-            row.setEnabled_(False)
-            row.setRepresentedObject_(("cursor", view))
-            menu.addItem_(row)
-        elif view.error:
-            self.add_info(menu, view.error)
-
-    @objc.python_method
-    def add_window(self, menu, window: Window) -> None:
+    def add_meter(self, menu, kind: str, payload, title) -> None:
         row = NSMenuItem.alloc().init()
-        row.setAttributedTitle_(_window_title(window))
+        row.setAttributedTitle_(title)
         row.setEnabled_(False)
-        row.setRepresentedObject_(("window", window))
-        menu.addItem_(row)
-
-    @objc.python_method
-    def add_extra(self, menu, extra: Extra) -> None:
-        row = NSMenuItem.alloc().init()
-        row.setAttributedTitle_(_extra_title(extra))
-        row.setEnabled_(False)
-        row.setRepresentedObject_(("extra", extra))
+        row.setRepresentedObject_((kind, payload))
         menu.addItem_(row)
 
     @objc.python_method
@@ -1055,17 +978,11 @@ class IAConsoApp(NSObject):
     @objc.python_method
     def refresh_live(self) -> None:
         # « depuis … » recalculé chaque tick sans reconstruire le menu.
-        for kind, item, payload in self.activity_headers:
-            if kind == "claude":
-                if payload is None:
-                    continue
-                item.setAttributedTitle_(_account_header(payload, self.activity.claude_rows()))
-            elif kind == "flat":
-                if self.snapshot.account is None:
-                    continue
-                item.setAttributedTitle_(_flat_account_header(self.snapshot, self.activity.claude_rows()))
-            elif kind == "cursor":
-                item.setAttributedTitle_(_cursor_header(payload, self.activity.cursor_rows()))
+        for item, view, live in self.activity_rows:
+            items = ()
+            if live:
+                items = self.activity.cursor if view.provider == CURSOR else self.activity.claude
+            item.setAttributedTitle_(_account_header(view, items))
         for item in self.menu.itemArray():
             payload = item.representedObject()
             if not isinstance(payload, tuple) or len(payload) != 2:
@@ -1075,16 +992,14 @@ class IAConsoApp(NSObject):
                 item.setAttributedTitle_(_window_title(value))
             elif kind == "extra":
                 item.setAttributedTitle_(_extra_title(value))
-            elif kind == "cursor":
-                title = _cursor_period_title(value)
-                if title is not None:
-                    item.setAttributedTitle_(title)
+            elif kind == "refill":
+                item.setAttributedTitle_(_refill_title(value))
 
     @objc.python_method
     def footer_text(self) -> str:
         if self.fetching:
             state = "actualisation…"
-        elif self.snapshot.fetched_at is None:
+        elif self.snapshot.attempted_at is None:
             state = "en attente"
         else:
             left = self.countdown()
@@ -1192,11 +1107,11 @@ class IAConsoApp(NSObject):
 
     @objc.python_method
     def bundle_program(self) -> str:
+        """L'exécutable du bundle, pas son dossier : c'est ce que launchd sait lancer."""
         bundle = NSBundle.mainBundle()
-        path = bundle.bundlePath()
-        if path.endswith(".app"):
-            return path
-        return ""
+        if bundle.bundleIdentifier() != BUNDLE_ID:
+            return ""
+        return str(bundle.executablePath() or "")
 
     def refresh_(self, sender):
         self.start_fetch(force=True)
@@ -1214,24 +1129,19 @@ class IAConsoApp(NSObject):
 
     def openHelp_(self, sender):
         account = self.snapshot.account
-        identity = ""
-        if account:
-            identity = " · ".join(p for p in (account.name, account.email, account.plan) if p)
+        identity = " · ".join(p for p in (account.name, account.email, account.plan) if p) if account else ""
         self.help_window = manual.panel({"identity": identity, "token": self.snapshot.token_origin})
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         self.help_window.window.makeKeyAndOrderFront_(None)
 
     def quitApp_(self, sender):
         self.activity_stop.set()
-        if self.timer is not None:
-            self.timer.invalidate()
-            self.timer = None
-        if self.hover_timer is not None:
-            self.hover_timer.invalidate()
-            self.hover_timer = None
-        if self.spinner_timer is not None:
-            self.spinner_timer.invalidate()
-            self.spinner_timer = None
+        NSWorkspace.sharedWorkspace().notificationCenter().removeObserver_(self)
+        for timer in ("timer", "hover_timer", "spinner_timer"):
+            handle = getattr(self, timer, None)
+            if handle is not None:
+                handle.invalidate()
+                setattr(self, timer, None)
         NSApplication.sharedApplication().terminate_(self)
 
 

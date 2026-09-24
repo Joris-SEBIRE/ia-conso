@@ -5,14 +5,10 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass, fields
-from pathlib import Path
 from types import UnionType
 from typing import Union, get_args, get_origin, get_type_hints
 
-CONFIG_PATH = Path(os.environ.get("IA_CONSO_CONFIG") or Path.home() / ".config" / "ia-conso" / "config.json")
-STATE_PATH = Path(
-    os.environ.get("IA_CONSO_STATE") or Path.home() / "Library" / "Application Support" / "IAConso" / "state.json"
-)
+from .paths import CONFIG_PATH
 
 
 def _accepted(hint) -> tuple:
@@ -56,5 +52,11 @@ class Config:
         return cfg
 
     def save(self) -> None:
+        """Écrit par un temporaire puis un renommage : le fil de fond relit ce fichier."""
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(json.dumps(asdict(self), indent=2, ensure_ascii=False) + "\n")
+        temporary = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
+        try:
+            temporary.write_text(json.dumps(asdict(self), indent=2, ensure_ascii=False) + "\n")
+            os.replace(temporary, CONFIG_PATH)
+        except OSError:
+            temporary.unlink(missing_ok=True)

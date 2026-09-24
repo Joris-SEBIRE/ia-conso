@@ -17,7 +17,8 @@ from Cocoa import (
     NSZeroRect,
 )
 
-CACHE_DIR = Path.home() / "Library" / "Caches" / "IAConso" / "avatars"
+from .paths import AVATARS_DIR as CACHE_DIR
+
 MAX_AGE = 14 * 86400
 SIZE = 22.0
 
@@ -35,7 +36,10 @@ class Avatars:
         return CACHE_DIR / (hashlib.sha1(url.encode()).hexdigest()[:16] + ".img")
 
     def prefetch(self, emails: set[str]) -> None:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
         for email in emails:
             if not email:
                 continue
@@ -53,9 +57,12 @@ class Avatars:
                 continue
             if not data:
                 continue
-            temporary = target.with_suffix(".part")
-            temporary.write_bytes(data)
-            temporary.replace(target)
+            try:
+                temporary = target.with_suffix(".part")
+                temporary.write_bytes(data)
+                temporary.replace(target)
+            except OSError:
+                continue
             for key in [k for k in self.rendered if k[0] == url]:
                 del self.rendered[key]
 

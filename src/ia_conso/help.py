@@ -34,7 +34,7 @@ from Cocoa import (
 
 from . import IDENTITY_TINT, VERSION
 from .anthropic import KEYCHAIN_SERVICE
-from .config import CONFIG_PATH, STATE_PATH
+from .paths import CLAUDE_SESSIONS, CONFIG_PATH, CURSOR_STATE_DB, ERRORS_PATH, STATE_DIR
 
 DOC_WIDTH = 620.0
 DOC_HEIGHT = 640.0
@@ -42,58 +42,90 @@ DOC_HEIGHT = 640.0
 TEXT = """
 # IA-Conso
 
-Où en est l'abonnement Claude, et quand il se réarme. **Lecture seule** : l'app ne consomme \
-aucun jeton, elle ne fait que demander le pourcentage déjà calculé par Anthropic.
+Où en est la conso des abonnements IA, et quand elle se réarme. **Lecture seule** : l'app ne \
+consomme aucun jeton, elle ne fait que lire des chiffres déjà calculés et des fichiers déjà \
+posés sur le disque.
 
 ## Cette installation
 
-- Compte : {identity}
+- Compte Claude : {identity}
 - Token fourni par : {token}
 - Réglages : `{config}`
-- Journal : `{errors}`
+- État et journal : `{state}`
 - Version {version}, code du {built}
 
-## D'où vient le chiffre
+## La barre
 
-Aucun token à coller. L'app relit celui que Claude Code (et Cursor) a déjà posé dans le \
-trousseau macOS, service `{service}`. C'est le même compte que tes sessions Cursor.
+Le chiffre est le pourcentage de la **session 5 h** de Claude ; l'anneau autour est la **semaine**. \
+Bleu jusqu'à 20 %, puis vert, jaune, orange, et rouge à partir de 80 %.
 
-Elle interroge ensuite `api.anthropic.com/api/oauth/usage`, le même endpoint que la commande \
-`/usage` de Claude Code. La réponse porte des **pourcentages**, pas un nombre de messages : \
-Anthropic ne publie pas le quota absolu.
+- Pastille en bas à gauche : les sessions qui **travaillent**, une par ligne du menu.
+- Pastille rouge en haut à droite : les sessions qui **attendent une réponse** de ta part.
+
+Les agents en vol appartiennent à une session : ils comptent sur sa ligne, pas dans la pastille, \
+pour que le chiffre de la barre se retrouve toujours dans le détail. L'infobulle en donne le total.
+
+## D'où viennent les chiffres
+
+Aucun token à coller. Pour Claude, l'app relit celui que Claude Code (et Cursor) a déjà posé dans \
+le trousseau macOS, service `{service}`, et interroge `api.anthropic.com/api/oauth/usage` — le même \
+endpoint que la commande `/usage`. La réponse porte des **pourcentages**, pas un nombre de messages.
 
 - **Session 5 h** : fenêtre glissante depuis le premier message. C'est le chiffre de la barre.
 - **Semaine** : plafond glissant sur 7 jours, tous modèles confondus.
-- **Sonnet / Opus** : plafonds hebdomadaires d'un modèle, seulement s'ils existent sur le plan.
-- **Extra** : crédits payants une fois le plan saturé, s'ils sont activés.
-- **Cette semaine** : répartition de la conso hebdomadaire (Claude Code, chats, Cowork…).
+- **Semaine <modèle>** : plafond hebdomadaire d'un modèle, affiché seulement s'il est entamé.
+- **Extra** : crédits hors forfait. Aucune API n'en date la remise à zéro : l'app dit « reset \
+mensuel » plutôt que d'inventer un jour.
 
-L'app **ne rafraîchit pas** le token. Un rafraîchissement ferait tourner le jeton de Claude \
+Pour Cursor, le token est lu dans sa base d'état (`{cursor}`) et la conso vient de \
+`GetCurrentPeriodUsage`. Le pourcentage affiché est celui que Cursor calcule lui-même : la \
+fraction « dépensé / forfait » reste collée à 100 % dès que le forfait est saturé et ne veut plus \
+rien dire.
+
+L'app **ne rafraîchit pas** le token Claude. Un rafraîchissement ferait tourner le jeton de Claude \
 Code et casserait Cursor. Si la session a expiré, ouvre Cursor une fois : il la renouvelle, \
 IA-Conso relit le trousseau au cycle suivant.
 
 ## Plusieurs organisations
 
-Le token ne voit qu'**une** org à la fois (Pro perso, Team Spacefill, etc.). L'app liste \
-toutes tes orgs « chat », montre la conso en live pour l'active, et mémorise la dernière \
-conso lue pour les autres. Pour mettre à jour une org inactive : bascule dessus dans Cursor, \
-attends un cycle (ou Actualiser).
+Le token ne voit qu'**une** org à la fois (Pro perso, Team, etc.). L'app liste toutes tes orgs \
+« chat », montre la conso en live pour l'active, et mémorise la dernière conso lue pour les autres. \
+Une fenêtre mémorisée dont l'échéance est passée n'est plus affichée : elle s'est réarmée depuis, \
+sa valeur n'a plus cours. Pour mettre à jour une org inactive : bascule dessus dans Cursor, \
+attends un cycle.
 
-## La barre
+## Ce qui travaille en ce moment
 
-Un pourcentage, celui de la session 5 h, dans un cercle qui se remplit d'autant. Bleu jusqu'à 20 %, puis vert, jaune, orange, et rouge à partir de 80 %. Un clic ouvre le \
-détail : compte, \
-session, semaine, extra, et le temps restant avant chaque reset.
+Sous chaque compte, l'app liste les sessions en cours, lues sur le disque, sans rien demander au \
+réseau :
+
+- Claude Code : `{sessions}` donne les sessions vivantes et leur état ; le transcript de chaque \
+session donne son titre, son **modèle**, son **effort**, le **contexte** occupé et le nombre \
+d'**agents** encore en vol.
+- Chaque ligne se lit dans le même ordre : titre, modèle (une couleur par famille), effort sous le libellé \
+même du sélecteur (`Extra high`, `Max`… ou `Ultracode` si le sixième cran est armé), puis en gris les agents, le contexte et la durée. En rouge, une session \
+qui attend ta réponse.
+- Cursor : la base d'état donne les agents en cours, leur modèle, leur contexte, et ceux qui \
+attendent une approbation.
+
+Une session en attente est comptée comme telle, pas comme active : elle ne consomme rien.
 
 ## Réglages
 
 Le cycle se règle dans `{config}`, clé `refresh_seconds` (60 s par défaut). L'app réécrit \
-le fichier s'il manque une clé, pour qu'il reste exhaustif.
+le fichier s'il manque une clé, pour qu'il reste exhaustif. Après un échec, elle attend au moins \
+30 s — et le délai demandé par Anthropic en cas de 429 — avant de retenter.
 
 ## Lancer au démarrage
 
 Le menu écrit `~/Library/LaunchAgents/fr.jsebire.ia-conso.plist`. Ce n'est pas une case \
 Système : la décocher ici retire le fichier.
+
+## Ce que l'app écrit
+
+Rien hors de ta machine, à une exception près : les photos de profil viennent de Gravatar, qui \
+reçoit donc une empreinte de l'adresse e-mail. Tout le reste est local : `{state}` (miroir de la \
+barre, conso mémorisée par org, journal des pannes) et le cache d'avatars.
 """
 
 
@@ -107,7 +139,10 @@ def document(context: dict) -> str:
         identity=context.get("identity") or "inconnu",
         token=context.get("token") or "aucun token trouvé",
         config=CONFIG_PATH,
-        errors=STATE_PATH.with_name("errors.log"),
+        state=STATE_DIR,
+        errors=ERRORS_PATH,
+        sessions=CLAUDE_SESSIONS,
+        cursor=CURSOR_STATE_DB,
         service=KEYCHAIN_SERVICE,
         version=VERSION,
         built=built_at(),
