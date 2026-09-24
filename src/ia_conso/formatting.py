@@ -236,6 +236,13 @@ def refill_line(refill, at: datetime | None = None) -> str:
     return "  ·  ".join(bit for bit in bits if bit)
 
 
+def window_reset_bits(window: Window, at: datetime | None = None) -> tuple[str, str]:
+    """La ligne d'échéance, ou, pour une fenêtre réarmée, ce qu'on en sait vraiment."""
+    if window.rearmed_at is not None:
+        return (f"réarmée {pinpoint(window.rearmed_at, at)} · conso inconnue depuis", "")
+    return reset_bits(window.resets_at, is_session=window.is_session, at=at)
+
+
 def account_title(name: str, plan: str) -> str:
     """Nom d'affichage d'un compte : raccourcit l'org perso, et porte toujours le plan à côté."""
     if any(mark in name for mark in ("'s Organization", "’s Organization", "'s Individual Org")):
@@ -310,8 +317,9 @@ def _view_lines(view: AccountView) -> list[str]:
         if window is None:
             continue
         detail = amounts(window.used, window.cap, window.currency)
+        text, when = window_reset_bits(window)
         lines.append(
-            f"  {window.label:<16} {percent(window.percent):>5}  {reset_line(window)}"
+            f"  {window.label:<16} {percent(window.percent):>5}  {' · '.join(p for p in (text, when) if p)}"
             + (f"  ·  {detail}" if detail else "")
         )
     if view.extra:

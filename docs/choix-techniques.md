@@ -50,12 +50,18 @@ Corollaire : `STUCK_AFTER` doit rester au-dessus de la somme des délais réseau
 10 s + cinq appels à 8 s), sinon le garde-fou déclare perdu un cycle qui allait aboutir, en lance un
 second, et le premier continue de tourner.
 
-## Une fenêtre mémorisée expirée n'a plus de valeur
+## Ce qui sort du cache se voit
 
-Le token ne voit qu'une organisation à la fois, d'où le cache par organisation. Mais une session
-5 h mémorisée hier s'est réarmée depuis : ressortir son pourcentage revient à afficher un chiffre
-faux, teinté comme une alerte. `_window_from` écarte donc toute fenêtre dont `resets_at` est passé,
-et le menu dit que la conso est inconnue plutôt que périmée.
+Le token ne voit qu'une organisation à la fois, d'où le cache par organisation. Ses chiffres
+gardent leur jauge — une jauge se lit mieux qu'une phrase — mais passent en retrait : ils disent où
+on en était, pas où on en est. Le critère n'est pas « compte inactif » mais
+« pas lu à ce cycle » (`AccountView.is_live`) : l'organisation active reprise après une panne de
+jeton est tout aussi ancienne, et porte la même marque.
+
+Une session 5 h mémorisée hier s'est réarmée depuis : ressortir son pourcentage serait afficher un
+chiffre faux, teinté comme une alerte. Elle ressort donc à zéro, datée de son réarmement, seule
+valeur encore certaine, avec « conso inconnue depuis ». La barre des menus, elle, n'a pas la place
+de dater un zéro : elle montre « — » plutôt qu'un zéro qui passerait pour une lecture.
 
 ## L'activité se lit par la queue des fichiers
 

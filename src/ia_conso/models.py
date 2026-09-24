@@ -50,6 +50,9 @@ class Window:
     used: float | None = None
     cap: float | None = None
     currency: str = ""
+    # Une fenêtre mémorisée dont l'échéance est passée : elle est repartie de zéro à cette date,
+    # et la seule valeur certaine est ce zéro.
+    rearmed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +104,8 @@ class AccountView:
     breakdown: tuple[tuple[str, float], ...] = ()
     fetched_at: datetime | None = None
     error: str = ""
+    # Lue en direct à ce cycle, ou ressortie du cache : seule la seconde peut être en retard.
+    is_live: bool = False
 
     @property
     def has_figures(self) -> bool:

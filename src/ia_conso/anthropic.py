@@ -404,6 +404,7 @@ def _views(account_payload: dict | None, active: Account | None, live: AccountVi
                 refills=live.refills,
                 breakdown=live.breakdown,
                 fetched_at=live.fetched_at,
+                is_live=True,
             )
             remember_account_view(view)
         else:

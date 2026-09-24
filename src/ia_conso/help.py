@@ -90,9 +90,9 @@ IA-Conso relit le trousseau au cycle suivant.
 
 Le token ne voit qu'**une** org à la fois (Pro perso, Team, etc.). L'app liste toutes tes orgs \
 « chat », montre la conso en live pour l'active, et mémorise la dernière conso lue pour les autres. \
-Une fenêtre mémorisée dont l'échéance est passée n'est plus affichée : elle s'est réarmée depuis, \
-sa valeur n'a plus cours. Pour mettre à jour une org inactive : bascule dessus dans Cursor, \
-attends un cycle.
+Ces chiffres mémorisés gardent leur jauge, en retrait : ils disent où tu en étais, pas où tu en es. Une fenêtre dont l'échéance est passée s'affiche vide, « réarmée » à sa \
+date : elle est repartie de zéro, et ce qui a été consommé depuis est inconnu. Pour mettre à jour \
+une org inactive : bascule dessus dans Cursor, attends un cycle.
 
 ## Ce qui travaille en ce moment
 

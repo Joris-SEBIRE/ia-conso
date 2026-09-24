@@ -67,8 +67,8 @@ from .formatting import (
     model_tint,
     percent,
     refill_line,
-    reset_bits,
     tint_for,
+    window_reset_bits,
 )
 from .models import CLAUDE, CURSOR, AccountView, Extra, Snapshot, Window, now
 from .paths import CONFIG_PATH
@@ -108,6 +108,9 @@ PERCENT_PAD = " "  # figure space = largeur d'un chiffre
 BAR_GAP = "  "
 BAR_BASELINE = (HERO_FONT - META_FONT) * 0.35
 ACTIVITY_TITLE_MAX = 42
+# Une jauge ressortie du cache reste lisible, en retrait de celles lues à l'instant.
+STALE_ALPHA = 0.5
+BAR_ALPHA = 0.85
 ACTIVITY_SEP = "  ·  "
 # L'effort reprend la couleur du modèle, en retrait : il la précise, il ne la concurrence pas.
 EFFORT_ALPHA = 0.75
@@ -154,9 +157,19 @@ def _percent_field(value: float | None) -> str:
     return percent(value).rjust(PERCENT_FIELD, PERCENT_PAD)
 
 
-def _meter_title(label: str, value: float | None, detail: str, reset: str = "", when: str = ""):
-    """Bloc commun : libellé + reset, puis « N %  ████ » teintés comme l'icône."""
-    tint = _colour(tint_for(value))
+def _meter_title(
+    label: str, value: float | None, detail: str, reset: str = "", when: str = "", stale: bool = False
+):
+    """Bloc commun : libellé + reset, puis « N %  ████ » teintés comme l'icône.
+
+    Un chiffre ressorti du cache garde sa jauge — elle se lit mieux qu'une phrase — mais passe en
+    retrait : il dit où on en était, pas où on en est.
+    """
+    # `colorWithAlphaComponent_` remplace l'alpha au lieu de le multiplier : chaque teinte du bloc
+    # part donc de la couleur pleine, sans quoi la barre effacerait le retrait du chiffre.
+    base = _colour(tint_for(value))
+    fade = STALE_ALPHA if stale else 1.0
+    tint = base.colorWithAlphaComponent_(fade)
     grey = NSColor.secondaryLabelColor()
     text = NSMutableAttributedString.alloc().init()
     text.appendAttributedString_(
@@ -166,7 +179,12 @@ def _meter_title(label: str, value: float | None, detail: str, reset: str = "", 
         text.appendAttributedString_(_run(f"  ·  {reset}", META_FONT, color=grey, weight=NSFontWeightMedium))
     if when:
         text.appendAttributedString_(
-            _run(f" · {when}", META_FONT, color=_colour(IDENTITY_TINT), weight=NSFontWeightSemibold)
+            _run(
+                f" · {when}",
+                META_FONT,
+                color=_colour(IDENTITY_TINT).colorWithAlphaComponent_(fade),
+                weight=NSFontWeightSemibold,
+            )
         )
     text.appendAttributedString_(
         _run(
@@ -183,7 +201,7 @@ def _meter_title(label: str, value: float | None, detail: str, reset: str = "", 
             _run(
                 f"{BAR_GAP}{_bar(value)}",
                 META_FONT,
-                color=tint.colorWithAlphaComponent_(0.85),
+                color=base.colorWithAlphaComponent_(BAR_ALPHA * fade),
                 weight=NSFontWeightMedium,
                 mono=True,
                 baseline=BAR_BASELINE,
@@ -196,12 +214,14 @@ def _meter_title(label: str, value: float | None, detail: str, reset: str = "", 
     return text
 
 
-def _window_title(window: Window):
-    reset, when = reset_bits(window.resets_at, is_session=window.is_session)
-    return _meter_title(window.label, window.percent, amounts(window.used, window.cap, window.currency), reset, when)
+def _window_title(window: Window, stale: bool = False):
+    reset, when = window_reset_bits(window)
+    return _meter_title(
+        window.label, window.percent, amounts(window.used, window.cap, window.currency), reset, when, stale
+    )
 
 
-def _extra_title(extra: Extra):
+def _extra_title(extra: Extra, stale: bool = False):
     detail = amounts(extra.used, extra.cap, extra.currency) if extra.cap else ""
     if not extra.is_enabled:
         why = DISABLED_REASONS.get(extra.disabled_reason, "désactivé")
@@ -210,7 +230,7 @@ def _extra_title(extra: Extra):
     if value is None:
         value = (100.0 * extra.used / extra.cap) if extra.cap else None
     reset, when = extra_bits(extra)
-    return _meter_title("extra", value, detail, reset, when)
+    return _meter_title("extra", value, detail, reset, when, stale)
 
 
 def _refill_title(refill):
@@ -370,6 +390,7 @@ def _account_summary(view: AccountView):
             weight=NSFontWeightMedium,
         )
     )
+    stale = not view.is_live
     bits = []
     if view.session:
         bits.append((f"{view.session.label} {percent(view.session.percent)}", tint_for(view.session.percent)))
@@ -382,7 +403,14 @@ def _account_summary(view: AccountView):
         for index, (label, bit_tint) in enumerate(bits):
             if index:
                 text.appendAttributedString_(_run("  ·  ", TITLE_FONT, color=grey, weight=NSFontWeightMedium))
-            text.appendAttributedString_(_run(label, TITLE_FONT, color=_colour(bit_tint), weight=NSFontWeightMedium))
+            text.appendAttributedString_(
+                _run(
+                    label,
+                    TITLE_FONT,
+                    color=_colour(bit_tint).colorWithAlphaComponent_(STALE_ALPHA if stale else 1.0),
+                    weight=NSFontWeightMedium,
+                )
+            )
     return text
 
 
@@ -750,7 +778,8 @@ class IAConsoApp(NSObject):
             # et on date la tentative pour que le prochain cycle respecte son palier.
             snapshot = Snapshot(
                 account=snapshot.account or self.snapshot.account,
-                views=self.snapshot.of(CLAUDE) + snapshot.of(CURSOR),
+                # Reprises d'un cycle précédent : elles n'ont pas été lues à celui-ci.
+                views=tuple(replace(view, is_live=False) for view in self.snapshot.of(CLAUDE)) + snapshot.of(CURSOR),
                 fetched_at=self.snapshot.fetched_at,
                 attempted_at=snapshot.attempted_at or now(),
                 error=snapshot.error,
@@ -807,8 +836,10 @@ class IAConsoApp(NSObject):
         if self.status_item is None or self.show_spinner:
             return
         active = self.snapshot.active
-        session = active.session if active else None
-        weekly = active.weekly if active else None
+        # Une fenêtre réarmée vaut zéro à sa date, pas maintenant : la barre n'a pas la place de
+        # le dire, elle montre donc « — » plutôt qu'un zéro qui passerait pour une lecture.
+        session = active.session if active and active.session and active.session.rearmed_at is None else None
+        weekly = active.weekly if active and active.weekly and active.weekly.rearmed_at is None else None
         running, waiting = self.activity.running_count, self.activity.waiting_count
         button = self.status_item.button()
         button.setImage_(
@@ -845,8 +876,10 @@ class IAConsoApp(NSObject):
                     "fournisseur": view.provider,
                     "nom": account_title(view.name, view.plan),
                     "actif": view.is_active,
-                    "session": view.session.percent if view.session else None,
-                    "semaine": view.weekly.percent if view.weekly else None,
+                    "en_direct": view.is_live,
+                    # Même règle que la barre : un zéro de réarmement n'est pas une lecture.
+                    "session": view.session.percent if view.session and view.session.rearmed_at is None else None,
+                    "semaine": view.weekly.percent if view.weekly and view.weekly.rearmed_at is None else None,
                     "maj": view.fetched_at.isoformat() if view.fetched_at else None,
                     "erreur": view.error,
                 }
@@ -932,11 +965,12 @@ class IAConsoApp(NSObject):
         self.activity_rows.append((row, view, live))
         if view.error:
             self.add_info(menu, view.error)
+        stale = not view.is_live
         for window in (view.session, view.weekly, *view.scoped):
             if window is not None:
-                self.add_meter(menu, "window", window, _window_title(window))
+                self.add_meter(menu, "window", (window, stale), _window_title(window, stale))
         if view.extra:
-            self.add_meter(menu, "extra", view.extra, _extra_title(view.extra))
+            self.add_meter(menu, "extra", (view.extra, stale), _extra_title(view.extra, stale))
         for refill in view.refills:
             self.add_meter(menu, "refill", refill, _refill_title(refill))
         for name, share in view.breakdown:
@@ -989,9 +1023,9 @@ class IAConsoApp(NSObject):
                 continue
             kind, value = payload
             if kind == "window":
-                item.setAttributedTitle_(_window_title(value))
+                item.setAttributedTitle_(_window_title(*value))
             elif kind == "extra":
-                item.setAttributedTitle_(_extra_title(value))
+                item.setAttributedTitle_(_extra_title(*value))
             elif kind == "refill":
                 item.setAttributedTitle_(_refill_title(value))
 

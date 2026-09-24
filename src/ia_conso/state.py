@@ -2,8 +2,8 @@
 
 Le token OAuth ne voit qu'une organisation à la fois. On mémorise donc la dernière conso lue
 pour chaque org : quand tu repasses dessus, le cache se met à jour ; sinon le menu montre
-encore le dernier chiffre connu — sauf les fenêtres dont l'échéance est passée, qui se sont
-réarmées depuis et dont on ne sait donc plus rien.
+encore le dernier chiffre connu. Une fenêtre dont l'échéance est passée s'est réarmée depuis :
+elle ressort à zéro, datée de son réarmement, seule valeur encore certaine.
 """
 
 from __future__ import annotations
@@ -89,7 +89,15 @@ def _window_from(blob, at: datetime | None = None) -> Window | None:
         return None
     resets_at = parse_ts(blob.get("resets_at"))
     if resets_at is not None and resets_at <= (at or now()):
-        return None
+        # Le pourcentage lu avant le réarmement est faux ; zéro, à cette date, est certain.
+        return Window(
+            label=str(blob.get("label") or ""),
+            percent=0.0,
+            resets_at=None,
+            is_session=bool(blob.get("is_session")),
+            currency=str(blob.get("currency") or ""),
+            rearmed_at=resets_at,
+        )
     return Window(
         label=str(blob.get("label") or ""),
         percent=float(blob["percent"]),

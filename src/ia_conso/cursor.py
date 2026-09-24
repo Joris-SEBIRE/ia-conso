@@ -213,4 +213,5 @@ def fetch() -> AccountView:
         scoped=_split(plan_usage, resets_at),
         extra=_overage(usage, resets_at),
         fetched_at=now(),
+        is_live=True,
     )
