@@ -55,13 +55,13 @@ from .avatars import Avatars
 from .config import Config
 from .cursor import fetch as fetch_cursor
 from .formatting import (
-    DISABLED_REASONS,
     account_title,
     activity_bits,
     age_seconds,
     amounts,
     countdown,
     extra_bits,
+    extra_gauge,
     freshness_label,
     freshness_tint,
     model_tint,
@@ -158,17 +158,19 @@ def _percent_field(value: float | None) -> str:
 
 
 def _meter_title(
-    label: str, value: float | None, detail: str, reset: str = "", when: str = "", stale: bool = False
+    label: str, value: float | None, detail: str, reset: str = "", when: str = "", faded: bool = False
 ):
     """Bloc commun : libellé + reset, puis « N %  ████ » teintés comme l'icône.
 
-    Un chiffre ressorti du cache garde sa jauge — elle se lit mieux qu'une phrase — mais passe en
-    retrait : il dit où on en était, pas où on en est.
+    Le bloc passe en retrait quand ce qu'il montre n'est pas à la disposition de l'utilisateur :
+    un chiffre ressorti du cache, qui dit où on en était et non où on en est, ou une fonction qu'il
+    ne peut pas utiliser. Le détail gris dit lequel des deux. Un quota plein n'en fait pas partie :
+    c'est une alerte, et le retrait l'éteindrait.
     """
     # `colorWithAlphaComponent_` remplace l'alpha au lieu de le multiplier : chaque teinte du bloc
     # part donc de la couleur pleine, sans quoi la barre effacerait le retrait du chiffre.
     base = _colour(tint_for(value))
-    fade = STALE_ALPHA if stale else 1.0
+    fade = STALE_ALPHA if faded else 1.0
     tint = base.colorWithAlphaComponent_(fade)
     grey = NSColor.secondaryLabelColor()
     text = NSMutableAttributedString.alloc().init()
@@ -217,20 +219,15 @@ def _meter_title(
 def _window_title(window: Window, stale: bool = False):
     reset, when = window_reset_bits(window)
     return _meter_title(
-        window.label, window.percent, amounts(window.used, window.cap, window.currency), reset, when, stale
+        window.label, window.percent, amounts(window.used, window.cap, window.currency), reset, when, faded=stale
     )
 
 
 def _extra_title(extra: Extra, stale: bool = False):
-    detail = amounts(extra.used, extra.cap, extra.currency) if extra.cap else ""
-    if not extra.is_enabled:
-        why = DISABLED_REASONS.get(extra.disabled_reason, "désactivé")
-        detail = f"{detail} · {why}" if detail else why
-    value = extra.percent
-    if value is None:
-        value = (100.0 * extra.used / extra.cap) if extra.cap else None
+    value, detail = extra_gauge(extra)
     reset, when = extra_bits(extra)
-    return _meter_title("extra", value, detail, reset, when, stale)
+    # Un extra qui ne couvre pas les envois n'est pas utilisable, quelle qu'en soit la raison.
+    return _meter_title("extra", value, detail, reset, when, faded=stale or not extra.is_enabled)
 
 
 def _refill_title(refill):
@@ -393,21 +390,23 @@ def _account_summary(view: AccountView):
     stale = not view.is_live
     bits = []
     if view.session:
-        bits.append((f"{view.session.label} {percent(view.session.percent)}", tint_for(view.session.percent)))
+        bits.append((f"{view.session.label} {percent(view.session.percent)}", tint_for(view.session.percent), stale))
     if view.weekly:
-        bits.append((f"semaine {percent(view.weekly.percent)}", tint_for(view.weekly.percent)))
-    if view.extra and view.extra.cap:
-        bits.append((f"extra {percent(view.extra.percent)}", tint_for(view.extra.percent)))
+        bits.append((f"semaine {percent(view.weekly.percent)}", tint_for(view.weekly.percent), stale))
+    if view.extra:
+        # Même lecture que la jauge dépliée, même retrait quand l'extra n'est pas utilisable.
+        value, _ = extra_gauge(view.extra)
+        bits.append((f"extra {percent(value)}", tint_for(value), stale or not view.extra.is_enabled))
     if bits:
         text.appendAttributedString_(_run("\n", TITLE_FONT, paragraph=_paragraph(before=2.0)))
-        for index, (label, bit_tint) in enumerate(bits):
+        for index, (label, bit_tint, faded) in enumerate(bits):
             if index:
                 text.appendAttributedString_(_run("  ·  ", TITLE_FONT, color=grey, weight=NSFontWeightMedium))
             text.appendAttributedString_(
                 _run(
                     label,
                     TITLE_FONT,
-                    color=_colour(bit_tint).colorWithAlphaComponent_(STALE_ALPHA if stale else 1.0),
+                    color=_colour(bit_tint).colorWithAlphaComponent_(STALE_ALPHA if faded else 1.0),
                     weight=NSFontWeightMedium,
                 )
             )

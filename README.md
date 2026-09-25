@@ -21,8 +21,9 @@ L'app ne fait que lire. Elle ne consomme aucun jeton.
   │     57 %  ███████░░░░░                                           │
   │ ◔  SEMAINE  ·  reset dans 3 j 12 h · lun. à 04:00                │
   │     64 %  ████████░░░░                                           │
-  │ 💳 EXTRA  ·  reset mensuel                                        │
-  │      0 %  ░░░░░░░░░░░░  ·  coupé par l'organisation              │
+  │ 💳 EXTRA  ·  réarmement estimé · jeu. à 00:00                     │
+  │     100 %  ████████████  ·  plafond de l'organisation atteint     │
+  │            · 0,00 € dépensés par toi                             │
   │ ───────────────────────────────────────────────────────────────  │
   │ ☺  Cursor Pro  ·  actif à l'instant                              │
   │ ◷  PÉRIODE  ·  reset dans 3 sem 3 j · dim. 18 oct. à 16:51       │
@@ -76,8 +77,10 @@ make uninstall  # retire l'app, le LaunchAgent et l'état local
 
 **Claude** : `GET https://api.anthropic.com/api/oauth/usage`, le même endpoint que `/usage` dans
 Claude Code. Anthropic y répond en **pourcentages** (session 5 h, semaine, plafonds par modèle),
-pas en nombre de messages. Les crédits extra sont rendus sans date de remise à zéro : l'app dit
-« reset mensuel » plutôt que d'inventer un jour.
+pas en nombre de messages. Pour les crédits extra, l'app distingue un plafond atteint (celui de
+l'organisation ou le tien), un solde prépayé épuisé et une vraie coupure par un admin — trois cas
+que l'API regroupe sous « désactivé ». L'échéance est estimée au 1er du mois, comme Claude Code la
+calcule lui-même.
 
 L'app ne rafraîchit pas le token. Un rafraîchissement ferait tourner le jeton de Claude Code et
 casserait Cursor. Si la session a expiré, ouvrir Cursor une fois suffit : il la renouvelle, et

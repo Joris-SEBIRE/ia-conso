@@ -31,12 +31,25 @@ L'app ne fait que lire. Consommer une remise à zéro est un `POST` sur
 `/api/organizations/<uuid>/reset_rate_limits` : c'est irréversible et décompté, donc cela reste la
 décision de l'utilisateur, dans Claude Code ou sur claude.ai.
 
-## Aucune date de reset pour les crédits extra
+## « Désactivé » ne veut pas dire éteint
 
-Ni `/usage`, ni `/profile`, ni `/account` ne datent la remise à zéro des crédits hors forfait :
-`spend` n'a que des montants, `extra_usage.daily` et `.weekly` sont nuls, et l'ancre de facturation
-de l'organisation n'est pas le 1er du mois. L'app affiche donc « reset mensuel » et laisse
-`resets_at` vide. Déduire une date au jour près donnerait une échéance fausse présentée comme sûre.
+Pour l'extra, `is_enabled` à faux veut dire « ne peut pas couvrir les envois en ce moment » — c'est
+la définition même de Claude Code. La cause est dans `disabled_reason`, et Claude Code en range
+trois parmi les états actifs mais bloqués : `org_level_disabled_until` (plafond mensuel de
+l'organisation atteint), `org_spend_cap_reached` (plafond individuel atteint) et `out_of_credits`
+(solde prépayé épuisé). Les autres raisons sont de vraies coupures, que seul un admin peut lever.
+
+`org_level_disabled_until` n'est un plafond atteint que si `extra_usage.spend_limit_reached` le
+confirme ; sans lui, Claude Code le traite comme une coupure. Et un membre d'équipe ne reçoit ni le
+plafond ni la dépense de son organisation : quand ce plafond est atteint, la jauge de l'organisation
+est pleine par définition, et la seule somme connue est la sienne.
+
+Le solde prépayé et le plafond mensuel sont deux compteurs : on peut être à sec avec un plafond à
+peine entamé. La jauge montre le plafond, la raison dit que c'est le solde qui bloque.
+
+L'API de conso ne date pas la remise à zéro. Claude Code la calcule localement au 1er du mois
+suivant, et c'est aussi ce que fixe son simulateur interne : l'app fait de même, en l'affichant
+« estimé ». Aucune date de bascule — « activé depuis », « coupé depuis » — n'est exposée.
 
 ## La cadence se compte sur la tentative, pas sur la donnée
 
@@ -50,13 +63,22 @@ Corollaire : `STUCK_AFTER` doit rester au-dessus de la somme des délais réseau
 10 s + cinq appels à 8 s), sinon le garde-fou déclare perdu un cycle qui allait aboutir, en lance un
 second, et le premier continue de tourner.
 
-## Ce qui sort du cache se voit
+## En retrait : ce qui n'est pas à ta disposition
 
-Le token ne voit qu'une organisation à la fois, d'où le cache par organisation. Ses chiffres
-gardent leur jauge — une jauge se lit mieux qu'une phrase — mais passent en retrait : ils disent où
-on en était, pas où on en est. Le critère n'est pas « compte inactif » mais
-« pas lu à ce cycle » (`AccountView.is_live`) : l'organisation active reprise après une panne de
-jeton est tout aussi ancienne, et porte la même marque.
+Une seule convention visuelle dit « pas à ta disposition tel quel » : le bloc passe à mi-opacité —
+libellé, chiffre, horodatage et barre ensemble. Elle couvre deux situations :
+
+- **un chiffre qui n'a pas été lu à ce cycle** (`AccountView.is_live` à faux) : un compte inactif,
+  ou l'organisation active reprise après une panne de jeton. Il dit où on en était, pas où on en est ;
+- **une fonction qu'on ne peut pas utiliser** : un extra qui ne couvre pas les envois, quelle
+  qu'en soit la raison — plafond d'équipe, solde à sec, coupure par un admin.
+
+Les deux partagent le signal, et le détail gris dit toujours laquelle des deux s'applique. Une
+jauge garde sa barre même vide : un trait à la place casserait l'alignement du menu.
+
+Un quota plein n'en fait pas partie. Une session ou une semaine à 100 % est la même situation — on
+ne peut plus rien faire — mais c'est l'alerte la plus importante du menu, et le retrait l'éteindrait.
+Elle reste en rouge vif.
 
 Une session 5 h mémorisée hier s'est réarmée depuis : ressortir son pourcentage serait afficher un
 chiffre faux, teinté comme une alerte. Elle ressort donc à zéro, datée de son réarmement, seule

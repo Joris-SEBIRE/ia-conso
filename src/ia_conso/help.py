@@ -74,8 +74,13 @@ endpoint que la commande `/usage`. La réponse porte des **pourcentages**, pas u
 - **Session 5 h** : fenêtre glissante depuis le premier message. C'est le chiffre de la barre.
 - **Semaine** : plafond glissant sur 7 jours, tous modèles confondus.
 - **Semaine <modèle>** : plafond hebdomadaire d'un modèle, affiché seulement s'il est entamé.
-- **Extra** : crédits hors forfait. Aucune API n'en date la remise à zéro : l'app dit « reset \
-mensuel » plutôt que d'inventer un jour.
+- **En retrait** : tout ce qui n'est pas à ta disposition passe à mi-opacité — un chiffre pas \
+lu à l'instant, ou une fonction que tu ne peux pas utiliser. Le texte gris dit laquelle. Une \
+session ou une semaine pleine reste en rouge vif : c'est une alerte.
+- **Extra** : crédits hors forfait. « Désactivé » y veut rarement dire éteint : l'app distingue \
+le plafond de l'organisation atteint (jauge pleine, avec ta propre dépense), le solde prépayé \
+épuisé (jauge du plafond mensuel, qui n'est pas ce qui bloque) et la vraie coupure par un admin. \
+L'échéance est estimée au 1er du mois, comme Claude Code la calcule lui-même.
 
 Pour Cursor, le token est lu dans sa base d'état (`{cursor}`) et la conso vient de \
 `GetCurrentPeriodUsage`. Le pourcentage affiché est celui que Cursor calcule lui-même : la \

@@ -13,7 +13,9 @@ import subprocess
 import urllib.error
 import urllib.request
 
-from .models import Account, AccountView, Extra, Refill, Snapshot, Window, now, parse_ts
+from dataclasses import replace
+
+from .models import Account, AccountView, Extra, Refill, Snapshot, Window, next_month_start, now, parse_ts
 from .paths import CLAUDE_JSON
 from .state import cached_account_view, remember_account_view
 
@@ -210,12 +212,22 @@ def _money(block: dict | None) -> tuple[float | None, str]:
 
 
 def _extra(data: dict) -> Extra | None:
+    """Crédits hors forfait, avec l'échéance de leur période quand elle s'applique."""
+    extra = _read_extra(data)
+    # Datée à la lecture : relue plus tard depuis le cache, elle ne doit pas glisser d'un mois.
+    return replace(extra, resets_at=next_month_start()) if extra and extra.resets_with_period else extra
+
+
+def _read_extra(data: dict) -> Extra | None:
     """Crédits hors forfait.
 
-    Aucun endpoint ne date leur remise à zéro : `resets_at` reste vide, et l'affichage dit
-    « reset mensuel » plutôt que d'inventer une échéance au jour près.
+    `is_enabled` à faux ne veut pas dire « éteint » : Claude Code le définit comme « ne peut pas
+    couvrir les envois en ce moment ». Seul `disabled_reason` dit pourquoi, et `spend_limit_reached`
+    — porté par `extra_usage` seulement — dit si c'est un plafond atteint.
     """
     spend = data.get("spend") if isinstance(data.get("spend"), dict) else {}
+    extra = data.get("extra_usage") if isinstance(data.get("extra_usage"), dict) else {}
+    reached = bool(extra.get("spend_limit_reached"))
     if spend:
         used, currency = _money(spend.get("used") if isinstance(spend.get("used"), dict) else None)
         cap, cap_currency = _money(spend.get("limit") if isinstance(spend.get("limit"), dict) else None)
@@ -235,8 +247,8 @@ def _extra(data: dict) -> Extra | None:
                 percent=value,
                 is_enabled=enabled,
                 disabled_reason=reason,
+                limit_reached=reached,
             )
-    extra = data.get("extra_usage") if isinstance(data.get("extra_usage"), dict) else {}
     if not extra:
         return None
     places = int(extra.get("decimal_places") or 2)
@@ -252,6 +264,7 @@ def _extra(data: dict) -> Extra | None:
         percent=float(extra["utilization"]) if extra.get("utilization") is not None else None,
         is_enabled=enabled,
         disabled_reason=reason,
+        limit_reached=reached,
     )
 
 

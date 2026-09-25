@@ -15,7 +15,9 @@ import threading
 import time
 from datetime import datetime
 
-from .models import CLAUDE, AccountView, Extra, Refill, Window, now, parse_ts
+from dataclasses import replace
+
+from .models import CLAUDE, AccountView, Extra, Refill, Window, next_month_start, now, parse_ts
 from .paths import ERRORS_PATH, LOCK_PATH, ORGS_PATH, STATE_DIR, STATUS_PATH
 
 ERRORS_MAX_BYTES = 1_000_000
@@ -120,21 +122,31 @@ def _extra_blob(extra: Extra | None) -> dict | None:
         "is_enabled": extra.is_enabled,
         "resets_at": extra.resets_at.isoformat() if extra.resets_at else None,
         "disabled_reason": extra.disabled_reason,
+        "limit_reached": extra.limit_reached,
     }
 
 
-def _extra_from(blob) -> Extra | None:
+def _extra_from(blob, read_at: datetime | None = None) -> Extra | None:
+    """Un extra mémorisé, réarmé si la période où il a été lu s'est close depuis."""
     if not isinstance(blob, dict) or blob.get("cap") is None:
         return None
-    return Extra(
+    extra = Extra(
         used=float(blob.get("used") or 0),
         cap=float(blob["cap"]),
         currency=str(blob.get("currency") or "EUR"),
         percent=float(blob["percent"]) if blob.get("percent") is not None else None,
         is_enabled=bool(blob.get("is_enabled", True)),
-        # Les caches d'avant portent une échéance qui avait été déduite, pas lue : on l'ignore.
+        resets_at=parse_ts(blob.get("resets_at")),
         disabled_reason=str(blob.get("disabled_reason") or ""),
+        limit_reached=bool(blob.get("limit_reached")),
     )
+    if not extra.resets_with_period:
+        return extra
+    # Les caches plus anciens n'ont pas d'échéance : elle se déduit du mois de la lecture.
+    ends = extra.resets_at or (next_month_start(read_at) if read_at else None)
+    if ends is not None and ends <= now():
+        return Extra(used=0.0, cap=extra.cap, currency=extra.currency, percent=0.0, is_enabled=True, rearmed_at=ends)
+    return replace(extra, resets_at=ends)
 
 
 def _refill_blob(refill: Refill) -> dict:
@@ -218,7 +230,7 @@ def cached_account_view(key: str, name: str, plan: str, email: str, is_active: b
         session=_window_from(store.get("session")),
         weekly=_window_from(store.get("weekly")),
         scoped=scoped,
-        extra=_extra_from(store.get("extra")),
+        extra=_extra_from(store.get("extra"), read_at=parse_ts(store.get("fetched_at"))),
         refills=tuple(r for blob in (store.get("refills") or []) if (r := _refill_from(blob))),
         breakdown=breakdown,
         fetched_at=parse_ts(store.get("fetched_at")),

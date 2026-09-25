@@ -27,6 +27,18 @@ def now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def next_month_start(at: datetime | None = None) -> datetime:
+    """Minuit, heure locale, le 1er du mois suivant : la période que Claude Code affiche.
+
+    La date est construite sans fuseau puis résolue en heure locale, pour prendre le décalage du
+    jour visé et non celui d'aujourd'hui : sans quoi, en octobre, le 1er novembre tomberait le
+    31 octobre à 23 h.
+    """
+    local = (at or now()).astimezone()
+    year, month = (local.year + 1, 1) if local.month == 12 else (local.year, local.month + 1)
+    return datetime(year, month, 1).astimezone()
+
+
 @dataclass(frozen=True)
 class Account:
     """L'identité derrière le token : la personne, pas l'organisation."""
@@ -66,6 +78,21 @@ class Extra:
     is_enabled: bool
     resets_at: datetime | None = None
     disabled_reason: str = ""
+    # Le plafond est atteint : distingue « bloqué jusqu'à la fin de la période » d'une vraie coupure.
+    limit_reached: bool = False
+    # Un extra mémorisé dont la période s'est close : son plafond est reparti de zéro à cette date.
+    rearmed_at: datetime | None = None
+
+    @property
+    def resets_with_period(self) -> bool:
+        """Ce qui le retient tombe au changement de mois : un plafond mensuel, atteint ou non.
+
+        Un solde prépayé à sec ne se recharge pas avec le mois, et une coupure par un admin dure
+        tant qu'il ne la lève pas.
+        """
+        if self.is_enabled or self.disabled_reason == "org_spend_cap_reached":
+            return True
+        return self.disabled_reason == "org_level_disabled_until" and self.limit_reached
 
 
 @dataclass(frozen=True)

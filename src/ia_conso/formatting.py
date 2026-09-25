@@ -23,11 +23,64 @@ FRESH_STALE = 3600
 WEEKDAYS = ("lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim.")
 MONTHS = ("janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc.")
 CURRENCY = {"EUR": "€", "USD": "$", "GBP": "£"}
-DISABLED_REASONS = {
-    "out_of_credits": "crédits épuisés",
-    "user_disabled": "désactivé manuellement",
-    "org_level_disabled_until": "coupé par l'organisation",
+# Les raisons que Claude Code connaît pour un extra qui ne couvre pas les envois, et leur nature.
+# Trois sont des blocages — l'extra est actif mais à sec, jusqu'à la fin de la période ou jusqu'au
+# prochain achat — les autres sont de vraies coupures, que seul un admin peut lever.
+BLOCKED_BY_ORG_CAP, BLOCKED_BY_OWN_CAP, BLOCKED_BY_BALANCE, TURNED_OFF = "org_cap", "own_cap", "balance", "off"
+EXTRA_REASONS = {
+    "org_level_disabled_until": ("plafond d'équipe atteint", BLOCKED_BY_ORG_CAP),
+    "org_spend_cap_reached": ("plafond individuel atteint", BLOCKED_BY_OWN_CAP),
+    "out_of_credits": ("solde prépayé épuisé", BLOCKED_BY_BALANCE),
+    "org_level_disabled": ("coupé par l'organisation", TURNED_OFF),
+    "org_service_level_disabled": ("service coupé pour l'organisation", TURNED_OFF),
+    "member_level_disabled": ("coupé par l'admin", TURNED_OFF),
+    "member_zero_credit_limit": ("plafond fixé à zéro par l'admin", TURNED_OFF),
+    "seat_tier_level_disabled": ("non inclus dans ce type de siège", TURNED_OFF),
+    "seat_tier_zero_credit_limit": ("non inclus dans ce type de siège", TURNED_OFF),
+    "group_zero_credit_limit": ("plafond du groupe fixé à zéro", TURNED_OFF),
+    "overage_not_provisioned": ("jamais activé", TURNED_OFF),
+    "no_limits_configured": ("aucun plafond configuré", TURNED_OFF),
+    "user_disabled": ("désactivé manuellement", TURNED_OFF),
 }
+
+
+def extra_reason(extra: Extra) -> tuple[str, str]:
+    """(libellé, nature) de l'état d'un extra qui ne couvre pas les envois.
+
+    `org_level_disabled_until` n'est un plafond atteint que si le serveur le confirme ; sinon,
+    Claude Code le traite comme une coupure ordinaire.
+    """
+    label, nature = EXTRA_REASONS.get(extra.disabled_reason, ("indisponible", TURNED_OFF))
+    if nature == BLOCKED_BY_ORG_CAP and not extra.limit_reached:
+        return ("coupé par l'organisation pour la période", TURNED_OFF)
+    return label, nature
+
+
+def extra_gauge(extra: Extra) -> tuple[float, str]:
+    """(remplissage de la jauge, détail) : ce qu'on peut montrer honnêtement de cet extra.
+
+    La jauge est toujours celle de l'utilisateur : sa dépense sur son propre plafond. Un plafond
+    d'équipe atteint n'est qu'une contrainte, dite dans le détail — l'utilisateur ne reçoit ni ce
+    plafond ni ce que l'équipe a dépensé. Sans plafond individuel, la jauge reste vide plutôt que de
+    céder la place à un trait : le détail dit la somme réellement dépensée.
+    """
+    if extra.rearmed_at is not None:
+        # Reparti de zéro à cette date ; l'en-tête le dit, ce qui a suivi est inconnu.
+        return 0.0, ""
+    spent = amounts(extra.used, extra.cap, extra.currency) if extra.cap else ""
+    ratio = extra.percent
+    if ratio is None and extra.cap:
+        ratio = 100.0 * extra.used / extra.cap
+    if extra.is_enabled:
+        return ratio or 0.0, spent
+    label, nature = extra_reason(extra)
+    if nature == BLOCKED_BY_ORG_CAP:
+        if extra.cap:
+            return ratio or 0.0, f"{spent} · {label}"
+        return 0.0, f"toi : {money(extra.used, extra.currency)}, sans plafond perso · {label}"
+    if nature == BLOCKED_BY_OWN_CAP:
+        return (ratio if ratio is not None else 100.0), f"{spent} · {label}" if spent else label
+    return ratio or 0.0, f"{spent} · {label}" if spent else label
 
 
 def _plural(label: str, count: int) -> str:
@@ -168,10 +221,19 @@ def reset_line(window: Window, at: datetime | None = None) -> str:
 
 
 def extra_bits(extra: Extra, at: datetime | None = None) -> tuple[str, str]:
-    """Aucune API ne date la remise à zéro des crédits : on ne promet qu'un rythme."""
-    if extra.resets_at is None:
-        return ("reset mensuel", "")
-    return reset_bits(extra.resets_at, at=at)
+    """Ce qui débloquera cet extra, et quand.
+
+    L'API de conso ne date pas la fin de la période : elle est posée à la lecture, au 1er du mois
+    suivant, comme Claude Code la calcule lui-même, et affichée « estimée ». Un solde à sec ne se
+    recharge pas avec le mois, et une coupure par un admin n'a pas d'échéance.
+    """
+    if extra.rearmed_at is not None:
+        return (f"réarmé {pinpoint(extra.rearmed_at, at)} · conso inconnue depuis", "")
+    if extra.resets_at is not None:
+        return (f"réarmement estimé {until(extra.resets_at, at)}", pinpoint(extra.resets_at, at))
+    if not extra.is_enabled and extra_reason(extra)[1] == BLOCKED_BY_BALANCE:
+        return ("débloqué au prochain achat de crédits", "")
+    return ("", "")
 
 
 def percent(value: float | None) -> str:
@@ -323,13 +385,9 @@ def _view_lines(view: AccountView) -> list[str]:
             + (f"  ·  {detail}" if detail else "")
         )
     if view.extra:
-        extra = view.extra
-        state = "" if extra.is_enabled else f"  {DISABLED_REASONS.get(extra.disabled_reason, 'désactivé')}"
-        lines.append(
-            f"  {'extra':<16} {percent(extra.percent):>5}  {' · '.join(p for p in extra_bits(extra) if p)}"
-            + (f"  ·  {amounts(extra.used, extra.cap, extra.currency)}" if extra.cap else "")
-            + state
-        )
+        value, detail = extra_gauge(view.extra)
+        tail = "  ·  ".join(p for p in (" · ".join(p for p in extra_bits(view.extra) if p), detail) if p)
+        lines.append(f"  {'extra':<16} {percent(value):>5}  {tail}".rstrip())
     for refill in view.refills:
         lines.append(f"  ↺ {refill_line(refill)}")
     for name, share in view.breakdown:
