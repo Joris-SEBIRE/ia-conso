@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, replace
@@ -60,6 +61,22 @@ MODEL_WORDS = ("opus", "sonnet", "haiku", "fable")
 _session_cache: dict[str, tuple[float, "SessionDetails"]] = {}
 # session → (octets déjà examinés, ultracode armé ou non)
 _ultra_cache: dict[str, tuple[int, bool | None]] = {}
+# Une commande lancée en arrière-plan rend la main aussitôt : la session repasse « idle » et
+# attend, parfois plusieurs minutes, la notification qui la réveillera. Ces deux traces du
+# transcript la bornent ; sans elles, une session qui fait tourner une recette paraît éteinte.
+# Deux façons d'y arriver : une commande lancée d'emblée en arrière-plan, ou une commande trop
+# longue que Claude Code y bascule d'office.
+BACKGROUND_LAUNCH = re.compile(
+    r"^(?:Command running in background with ID: ?|"
+    r"Command did not complete within .{1,40}? moved to the background \(ID: ?)([A-Za-z0-9]+)"
+)
+BACKGROUND_HINTS = ("Command running in background", "moved to the background")
+BACKGROUND_NOTICE = "<task-notification>"
+BACKGROUND_ID = re.compile(r"<task-id>([^<]+)</task-id>")
+# Une commande jamais notifiée (session tuée, notification perdue) ne compte plus au-delà.
+BACKGROUND_STALE_SECONDS = 2 * 3600
+# session → (octets lus, lancées {id: epoch s}, notifiées)
+_background_cache: dict[str, tuple[int, dict[str, float], set[str]]] = {}
 _agents_cache: dict[str, tuple[tuple, int]] = {}
 
 
@@ -84,6 +101,8 @@ class ActivityItem:
     effort: str = ""
     is_ultra: bool = False
     agents: int = 0
+    # Commandes lancées en arrière-plan, qui travaillent pendant que la session attend.
+    background: int = 0
     context_tokens: int = 0
     context_percent: float | None = None
 
@@ -177,6 +196,65 @@ def _ultra_state(session_id: str, path: Path, size: int) -> bool:
     active = _last_ultra(_read_at(path, size - ULTRA_SCAN_MAX, size))
     _ultra_cache[session_id] = (size, active)
     return bool(active)
+
+
+def _notice_ids(text: str) -> set[str]:
+    return set(BACKGROUND_ID.findall(text)) if text.lstrip().startswith(BACKGROUND_NOTICE) else set()
+
+
+def _scan_background(chunk: bytes, launched: dict[str, float], notified: set[str]) -> None:
+    """Relève les lancements en arrière-plan et leurs notifications de fin.
+
+    On ne retient que les traces laissées par Claude Code lui-même : un résultat d'outil qui
+    commence par l'accusé de lancement, une notification en tête de message. Une session qui
+    cite ces textes dans ses propres sorties ne fabrique ainsi aucune fausse tâche.
+    """
+    for line in chunk.decode("utf-8", errors="ignore").split("\n"):
+        if BACKGROUND_NOTICE not in line and not any(hint in line for hint in BACKGROUND_HINTS):
+            continue
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "queue-operation":
+            notified |= _notice_ids(str(event.get("content") or ""))
+            continue
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        content = message.get("content")
+        if isinstance(content, str):
+            notified |= _notice_ids(content)
+            continue
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                notified |= _notice_ids(str(block.get("text") or ""))
+            elif block.get("type") == "tool_result":
+                text = block.get("content")
+                if isinstance(text, list):
+                    text = " ".join(str(part.get("text") or "") for part in text if isinstance(part, dict))
+                if match := BACKGROUND_LAUNCH.match(str(text or "")):
+                    launched[match.group(1)] = _as_ms(event.get("timestamp")) / 1000 or time.time()
+
+
+def _background_tasks(session_id: str, path: Path, size: int) -> int:
+    """Commandes en arrière-plan encore en cours : lancées, jamais notifiées, et récentes."""
+    seen, launched, notified = _background_cache.get(session_id, (0, {}, set()))
+    if not seen or size < seen:
+        # Première lecture, ou fichier réécrit : on remonte depuis la fin, sans dépasser la borne.
+        seen, launched, notified = max(0, size - ULTRA_SCAN_MAX), {}, set()
+    if size > seen:
+        chunk = _read_at(path, seen, size)
+        # Une ligne en cours d'écriture sera relue entière au passage suivant.
+        cut = chunk.rfind(b"\n")
+        if cut >= 0:
+            _scan_background(chunk[: cut + 1], launched, notified)
+            seen += cut + 1
+    _background_cache[session_id] = (seen, launched, notified)
+    horizon = time.time() - BACKGROUND_STALE_SECONDS
+    return sum(1 for task, at in launched.items() if task not in notified and at >= horizon)
 
 
 def _model_label(name: str) -> str:
@@ -365,10 +443,19 @@ def _claude_sessions() -> tuple[ActivityItem, ...]:
         if not _pid_alive(pid):
             continue
         status = str(blob.get("status") or "").strip().lower()
-        if status in CLAUDE_IDLE:
-            continue
         session_id = str(blob.get("sessionId") or "").strip()
-        details = _session_details(session_id, str(blob.get("cwd") or "").strip())
+        cwd = str(blob.get("cwd") or "").strip()
+        agents = _workflow_agents(session_id) + _loose_agents(session_id)
+        transcript = _transcript(session_id, cwd)
+        try:
+            background = _background_tasks(session_id, transcript, transcript.stat().st_size) if transcript else 0
+        except OSError:
+            background = 0
+        # « idle » veut dire « attend l'utilisateur », pas « ne fait rien » : une session qui a rendu
+        # la main pendant que ses agents ou une commande de fond travaillent est encore à l'œuvre.
+        if status in CLAUDE_IDLE and not (agents or background):
+            continue
+        details = _session_details(session_id, cwd)
         started = _as_ms(blob.get("startedAt") or 0)
         items.append(
             ActivityItem(
@@ -379,7 +466,8 @@ def _claude_sessions() -> tuple[ActivityItem, ...]:
                 model=details.model,
                 effort=details.effort,
                 is_ultra=details.is_ultra,
-                agents=_workflow_agents(session_id) + _loose_agents(session_id),
+                agents=agents,
+                background=background,
                 context_tokens=details.context_tokens,
             )
         )

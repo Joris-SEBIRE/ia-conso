@@ -133,6 +133,15 @@ Une session en attente d'une réponse ne consomme rien : elle est comptée dans 
 retirée de celle des actifs. Ses agents de fond, en revanche,
 continuent de tourner et restent comptés.
 
+« idle » veut dire « attend l'utilisateur », pas « ne fait rien ». Une session qui lance une commande
+en arrière-plan — une recette de plusieurs minutes, par exemple — rend la main aussitôt et passe
+« idle » jusqu'à la notification qui la réveille. Sans autre signal, elle paraît éteinte pendant
+tout ce temps. Le transcript borne ces commandes : un résultat d'outil qui commence par l'accusé de
+lancement (lancée d'emblée en arrière-plan, ou basculée d'office après un délai), puis une
+notification en tête de message. Une commande lancée mais jamais notifiée depuis deux heures ne
+compte plus : la session a pu être tuée entre-temps. Une session « idle » reste donc affichée tant
+qu'elle a des agents ou des commandes de fond en vol.
+
 Les agents en vol se lisent de deux façons, parce qu'ils ne laissent pas la même trace. Ceux d'un
 workflow ont un journal qui les ouvre et les ferme (`started` sans `result` ni `failed`), à
 condition de n'ouvrir que les journaux encore chauds : un workflow interrompu laisse ses agents

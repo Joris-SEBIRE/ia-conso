@@ -357,6 +357,9 @@ def activity_bits(item, now_ms: int) -> list[tuple[str, str]]:
         bits.append(("effort", label))
     if item.agents:
         bits.append(("muted", f"{item.agents} agent" + ("s" if item.agents > 1 else "")))
+    if getattr(item, "background", 0):
+        count = item.background
+        bits.append(("muted", f"{count} tâche{'s' if count > 1 else ''} de fond"))
     if item.context_percent is not None:
         bits.append(("muted", f"contexte {percent(item.context_percent)}"))
     elif item.context_tokens:

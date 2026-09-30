@@ -113,7 +113,9 @@ qui attend ta réponse.
 - Cursor : la base d'état donne les agents en cours, leur modèle, leur contexte, et ceux qui \
 attendent une approbation.
 
-Une session en attente est comptée comme telle, pas comme active : elle ne consomme rien.
+Une session en attente est comptée comme telle, pas comme active : elle ne consomme rien. Une session qui \
+t'a rendu la main pendant qu'une commande de fond ou des agents travaillent reste affichée, \
+avec le nombre de tâches de fond en cours.
 
 ## Réglages
 
