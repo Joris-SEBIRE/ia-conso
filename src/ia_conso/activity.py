@@ -23,8 +23,8 @@ from .paths import CLAUDE_PROJECTS, CLAUDE_SESSIONS, CURSOR_STATE_DB as STATE_DB
 
 # Fenêtre de fraîcheur d'un run Cursor (lastUpdatedAt / startedAtMs outil).
 RUN_HOT_SECONDS = 15 * 60
-# Une session terminée reste visible une heure, le temps de savoir ce qui vient de finir.
-RECENT_SECONDS = 60 * 60
+# Une session terminée reste visible cinq heures, le temps de savoir ce qui a fini depuis.
+RECENT_SECONDS = 5 * 3600
 # Une session coupée par une limite reste à relancer : visible jusqu'à sa relance, et au plus un
 # jour après le reset de la limite. Une limite hebdo peut tomber jusqu'à sept jours plus tard.
 HALTED_KEEP_SECONDS = 86400
@@ -36,9 +36,13 @@ TOOL_HOT_SECONDS = 5 * 60
 SESSION_STALE_SECONDS = 7 * 86400
 # Queue de transcript relue à chaque changement : les jsonl montent à la centaine de Mo.
 TAIL_BYTES = 256_000
-# Status Claude Code qui ne consomment pas / n'attendent rien.
-CLAUDE_IDLE = frozenset({"idle", "done", "finished", "stopped", "exited", ""})
+# Status Claude Code qui ne consomment pas / n'attendent rien. En terminal, « shell » est un idle
+# pendant qu'une commande de fond tourne.
+CLAUDE_IDLE = frozenset({"idle", "shell", "done", "finished", "stopped", "exited", ""})
 CLAUDE_WAITING = frozenset({"waiting"})
+# En terminal, un dialogue ouvert par l'utilisateur (/model, /config…) s'écrit aussi « waiting » :
+# ce n'est pas la session qui demande quelque chose.
+CLAUDE_OWN_DIALOG = "dialog open"
 SHELL_PENDING = frozenset({"pending"})
 SHELL_RUNNING = frozenset({"running", "loading", "pending"})
 TOOL_RUNNING = frozenset({"loading"})
@@ -60,6 +64,11 @@ ULTRA_OVERLAP = 256
 # transcript bouge. Il peut donc disparaître un instant s'il réfléchit longtemps sans écrire.
 AGENT_IDLE_SECONDS = 120
 AGENT_CLOSED = frozenset({"result", "failed", "skipped", "cancelled"})
+# Le modèle des messages que Claude Code écrit lui-même : erreurs d'API, « No response requested. ».
+SYNTHETIC_MODEL = "<synthetic>"
+# Ce que Claude Code inscrit comme message de l'utilisateur quand il coupe un tour : Échap, ou
+# un outil refusé (« … for tool use »).
+INTERRUPTED_MARK = "[Request interrupted by user"
 # Un prompt sert de titre de repli : au-delà, il ne tiendrait sur aucune ligne.
 PROMPT_MAX = 120
 # Les transcripts nomment le modèle en clair : on ne garde que ce qui se lit dans un menu.
@@ -102,6 +111,8 @@ class SessionDetails:
     halt: str = ""
     limit: str = ""
     resets_ms: int = 0
+    # Le dernier tour a été coupé par l'utilisateur.
+    is_interrupted: bool = False
 
 
 @dataclass(frozen=True)
@@ -112,12 +123,16 @@ class ActivityItem:
     title: str
     since_ms: int = 0
     is_waiting: bool = False
+    # Un tour est en cours : la session elle-même travaille, pas seulement ses agents ou ses tâches.
+    is_busy: bool = False
     model: str = ""
     effort: str = ""
     is_ultra: bool = False
     agents: int = 0
     # Commandes lancées en arrière-plan, qui travaillent pendant que la session attend.
     background: int = 0
+    # Le dernier tour a été coupé par l'utilisateur, alors qu'une commande de fond la garde affichée.
+    is_interrupted: bool = False
     context_tokens: int = 0
     context_percent: float | None = None
 
@@ -134,6 +149,8 @@ class FinishedItem:
     # Pour une limite : laquelle (`five_hour`, `seven_day`…) et quand elle se réarme.
     limit: str = ""
     resets_ms: int = 0
+    # Coupée par l'utilisateur lui-même : Échap, ou un outil refusé.
+    is_interrupted: bool = False
 
 
 @dataclass(frozen=True)
@@ -143,6 +160,9 @@ class Activity:
     # Ce qui a fini récemment : affiché pour mémoire, jamais compté dans les pastilles.
     claude_finished: tuple[FinishedItem, ...] = ()
     cursor_finished: tuple[FinishedItem, ...] = ()
+    # Sessions lues à l'instant comme ayant rendu la main. Une session absente
+    # n'y est pas : un fichier lu au mauvais moment ne doit pas passer pour une session finie.
+    settled: frozenset[str] = frozenset()
 
     @property
     def items(self) -> tuple[ActivityItem, ...]:
@@ -321,6 +341,7 @@ def _read_session(path: Path) -> SessionDetails:
     """
     custom = ai = model = effort = prompt = halt = limit = ""
     context = ended = resets = 0
+    interrupted = False
     for line in _tail(path).split("\n"):
         if "{" not in line:
             continue
@@ -340,9 +361,20 @@ def _read_session(path: Path) -> SessionDetails:
         if kind == "last-prompt":
             prompt = " ".join(str(event.get("lastPrompt") or "").split())[:PROMPT_MAX] or prompt
             continue
+        if kind == "user" and not event.get("isSidechain") and INTERRUPTED_MARK in line:
+            message = event.get("message") if isinstance(event.get("message"), dict) else {}
+            content = message.get("content")
+            blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
+            # Un tour coupé avant toute réponse ne laisse que ce marqueur : c'est lui qui le date.
+            texts = (str(block.get("text") or "") for block in blocks if isinstance(block, dict))
+            if any(text.startswith(INTERRUPTED_MARK) for text in texts):
+                interrupted = True
+                ended = _as_ms(event.get("timestamp")) or ended
+            continue
         # Un message d'agent n'est ni le modèle, ni la fin, ni la coupure de la session elle-même.
         if kind == "assistant" and not event.get("isSidechain"):
             ended = _as_ms(event.get("timestamp")) or ended
+            interrupted = False
             if event.get("isApiErrorMessage"):
                 quota = event.get("quotaLimits") if isinstance(event.get("quotaLimits"), dict) else {}
                 halt = str(event.get("error") or "unknown")
@@ -351,6 +383,9 @@ def _read_session(path: Path) -> SessionDetails:
                 continue
             halt, limit, resets = "", "", 0
             message = event.get("message") if isinstance(event.get("message"), dict) else {}
+            # « No response requested. » après une interruption : synthétique lui aussi, sans usage.
+            if message.get("model") == SYNTHETIC_MODEL:
+                continue
             model = str(message.get("model") or "") or model
             effort = str(event.get("perTurnEffort") or event.get("effort") or "") or effort
             usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
@@ -369,6 +404,7 @@ def _read_session(path: Path) -> SessionDetails:
         halt=halt,
         limit=limit,
         resets_ms=resets,
+        is_interrupted=interrupted,
     )
 
 
@@ -462,20 +498,24 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _claude_sessions() -> tuple[ActivityItem, ...]:
-    """Sessions Claude Code vivantes et non idle, une ligne par session.
+def _claude_sessions() -> tuple[tuple[ActivityItem, ...], frozenset[str]]:
+    """Sessions Claude Code vivantes et non idle, une ligne par session, et celles qui ont rendu la main.
 
     Une session se reconnaît à son `sessionId` : c'est lui qui la relie à son transcript, donc à
     la liste des sessions terminées, et deux process qui reprennent la même session n'en font qu'une.
+    Une session qui a rendu la main a fini son travail, même si une commande de fond tourne encore :
+    un serveur lancé en arrière-plan ne s'arrête jamais de lui-même.
     """
     if not CLAUDE_SESSIONS.is_dir():
-        return ()
+        return (), frozenset()
     items: dict[str, ActivityItem] = {}
+    settled: set[str] = set()
+    busy: set[str] = set()
     stale_before = time.time() - SESSION_STALE_SECONDS
     try:
         paths = sorted(CLAUDE_SESSIONS.glob("*.json"))
     except OSError:
-        return ()
+        return (), frozenset()
     for path in paths:
         if not path.stem.isdigit():
             continue
@@ -494,6 +534,8 @@ def _claude_sessions() -> tuple[ActivityItem, ...]:
         if not _pid_alive(pid):
             continue
         status = str(blob.get("status") or "").strip().lower()
+        if status in CLAUDE_WAITING and blob.get("waitingFor") == CLAUDE_OWN_DIALOG:
+            status = "idle"
         session_id = str(blob.get("sessionId") or "").strip()
         cwd = str(blob.get("cwd") or "").strip()
         agents = _workflow_agents(session_id) + _loose_agents(session_id)
@@ -503,28 +545,38 @@ def _claude_sessions() -> tuple[ActivityItem, ...]:
         except OSError:
             size = 0
         background = _background_tasks(session_id, transcript, size) if size else 0
+        key = session_id or f"pid:{pid}"
+        # Claude Code garde la session « busy » tant que ses agents ou son workflow tournent : son
+        # « idle » est la vraie fin du tour, que les agents comptés ici soient retombés ou non.
+        if status in CLAUDE_IDLE:
+            settled.add(key)
+        elif status not in CLAUDE_WAITING:
+            busy.add(key)
+        details = _session_details(session_id, transcript)
         # « idle » veut dire « attend l'utilisateur », pas « ne fait rien » : une session qui a rendu
         # la main pendant que ses agents ou une commande de fond travaillent est encore à l'œuvre.
-        if status in CLAUDE_IDLE and not (agents or background):
+        # Coupée par une erreur, elle est à relancer, et sa ligne passe dans les terminées.
+        if status in CLAUDE_IDLE and not (agents or (background and not details.halt)):
             continue
-        key = session_id or f"pid:{pid}"
         if key in items:
             continue
-        details = _session_details(session_id, transcript)
         started = _as_ms(blob.get("startedAt") or 0)
         items[key] = ActivityItem(
             key=key,
             title=details.title or str(blob.get("name") or "").strip() or details.last_prompt or path.stem,
             since_ms=_as_ms(blob.get("statusUpdatedAt") or started) or started,
             is_waiting=status in CLAUDE_WAITING,
+            is_busy=status not in CLAUDE_IDLE and status not in CLAUDE_WAITING,
             model=details.model,
             effort=details.effort,
             is_ultra=_ultra_state(session_id, transcript, size) if size else False,
             agents=agents,
             background=background,
+            is_interrupted=details.is_interrupted,
             context_tokens=details.context_tokens,
         )
-    return tuple(items.values())
+    # Deux process sur la même session : si l'un travaille, elle n'a pas rendu la main.
+    return tuple(items.values()), frozenset(settled - busy)
 
 
 def _transcripts(since: float) -> list[tuple[Path, float]]:
@@ -546,7 +598,7 @@ def _transcripts(since: float) -> list[tuple[Path, float]]:
 
 
 def _claude_finished(running: set[str]) -> tuple[FinishedItem, ...]:
-    """Sessions qui ne travaillent plus : finies dans l'heure, ou coupées et pas encore relancées.
+    """Sessions qui ne travaillent plus : finies depuis moins de cinq heures, ou coupées et pas encore relancées.
 
     Le transcript reste quand la session se ferme, c'est donc lui qui fait foi, et la fin d'une
     session est celle de son dernier tour : la date du fichier bouge encore à sa reprise. Une
@@ -574,6 +626,7 @@ def _claude_finished(running: set[str]) -> tuple[FinishedItem, ...]:
             halt=details.halt,
             limit=details.limit,
             resets_ms=details.resets_ms,
+            is_interrupted=details.is_interrupted,
         )
     return tuple(sorted(finished.values(), key=lambda item: (not item.halt, -item.ended_ms)))
 
@@ -657,7 +710,7 @@ def _cursor_pending_approval(con: sqlite3.Connection, composer_id: str, now_ms: 
 
 
 def _cursor_agents() -> tuple[tuple[ActivityItem, ...], tuple[FinishedItem, ...]]:
-    """Agents Cursor locaux, en cours puis terminés dans l'heure, identifiés par leur composerId.
+    """Agents Cursor locaux, en cours puis terminés depuis moins de cinq heures, identifiés par leur composerId.
 
     Un composer qui n'a pas bougé depuis la fenêtre de fraîcheur ne peut plus être en cours : il
     est terminé sans qu'on ait à charger son composerData. Un brouillon, ou un composer qui n'a pas
@@ -693,7 +746,8 @@ def _cursor_agents() -> tuple[tuple[ActivityItem, ...], tuple[FinishedItem, ...]
             if touched < recent:
                 continue
             if touched < cutoff:
-                if name and not header.get("isDraft"):
+                # Bloqué sur une approbation, il n'a rien fini : il attend, hors de la fenêtre.
+                if name and not header.get("isDraft") and not header.get("hasBlockingPendingActions"):
                     finished.append(FinishedItem(key=cid, title=name, ended_ms=touched))
                 continue
             blob = {}
@@ -726,6 +780,7 @@ def _cursor_agents() -> tuple[tuple[ActivityItem, ...], tuple[FinishedItem, ...]
                     title=str(blob.get("name") or header.get("name") or "").strip() or cid,
                     since_ms=(wait_since or run_since) if waiting else run_since,
                     is_waiting=waiting,
+                    is_busy=not waiting,
                     model=("auto" if model == "default" else model) + (" max" if config.get("maxMode") else ""),
                     agents=int(header.get("numSubComposers") or 0),
                     context_percent=float(context) if isinstance(context, (int, float)) else None,
@@ -794,18 +849,21 @@ def _cursor_cloud() -> tuple[ActivityItem, ...]:
                     title=title,
                     since_ms=_as_ms(agent.get("updatedAt") or agent.get("createdAt") or 0),
                     is_waiting=waiting,
+                    is_busy=not waiting,
                 )
             )
     return tuple(items)
 
 
 def probe() -> Activity:
-    claude = _claude_sessions()
+    claude, settled = _claude_sessions()
     local, ended = _cursor_agents()
     cursor = {item.key: item for item in (*_cursor_cloud(), *local)}
+    cursor_finished = tuple(item for item in ended if item.key not in cursor)
     return Activity(
         claude=claude,
         cursor=tuple(cursor[key] for key in sorted(cursor)),
         claude_finished=_claude_finished({item.key for item in claude}),
-        cursor_finished=tuple(item for item in ended if item.key not in cursor),
+        cursor_finished=cursor_finished,
+        settled=settled | {item.key for item in cursor_finished},
     )

@@ -173,6 +173,47 @@ Côté Cursor, un composer qui n'a pas bougé depuis la fenêtre de fraîcheur n
 cours : il est terminé à sa dernière mise à jour. Un brouillon, ou un composer sans nom, n'a jamais
 rien fait et n'est pas listé.
 
+## Quand sonner
+
+Un son se décide sur une transition entre deux sondages, jamais sur un état : une session qui
+attend depuis dix minutes ne resonne pas à chaque seconde, et le premier sondage après le
+lancement ne sonne jamais.
+
+**Fin de tour.** Une session sonne quand on l'a vue travailler (`busy`) puis qu'on la lit revenue
+à `idle`. C'est le statut de Claude Code qui fait foi : il garde la session `busy` tant que ses
+agents ou son workflow tournent, et son `idle` est la vraie fin du tour — une session qui a lancé
+des agents sonne donc une fois, à la fin. Le comptage d'agents de l'app, qui les retient encore un
+moment après leur dernière écriture, sert à l'affichage, pas au son. Une commande de fond ne
+retient pas le son non plus : un serveur lancé en arrière-plan ne s'arrête jamais, et la réponse
+est déjà là. En terminal, Claude Code écrit `shell` pour cet état-là : c'est un `idle`.
+
+La session doit être lue revenue au calme, pas seulement absente : un fichier de session lu au
+moment où Claude Code le réécrit disparaît le temps d'un sondage, et n'a rien fini pour autant.
+Une absence plus longue est une session fermée en plein tour : elle est oubliée, pour ne pas
+sonner le jour où elle est rouverte.
+
+**Intervention.** Une session qui passe à `waiting` — permission, question, plan à valider — alors
+qu'on la lisait juste avant sans qu'elle attende. En terminal, un dialogue que l'utilisateur ouvre
+lui-même (`/model`, `/config`) s'écrit aussi `waiting`, avec `waitingFor: "dialog open"` : ce n'est
+pas la session qui demande, et il compte comme un `idle`.
+
+Une session coupée par une erreur d'API sonne ce son-là plutôt que celui de la fin : elle est à
+relancer. Un tour coupé en moins d'une seconde peut tomber entre deux sondages sans qu'on ait vu
+la session travailler ; c'est donc l'apparition d'une coupure dans la liste des terminées qui
+sonne, chacune une seule fois, reconnue par sa session et sa date.
+
+**Silence.** Un tour coupé par l'utilisateur ne sonne pas : Claude Code inscrit alors un message
+`[Request interrupted by user]` (ou `… for tool use]` pour un outil refusé), que le transcript
+garde jusqu'au tour suivant. Coupé avant toute réponse, le tour n'a que ce marqueur pour le dater :
+c'est lui qui fixe sa fin. Le message `<synthetic>` « No response requested. » qui suit ne dit rien
+du modèle ni du contexte.
+
+Deux sons dans le même sondage n'en font qu'un, l'intervention d'abord — sauf si son nom est vide
+dans les réglages, auquel cas la fin de tour sonne quand même.
+
+Côté Cursor, un composer bloqué sur une approbation peut rester sans mise à jour bien au-delà de
+la fenêtre de fraîcheur : il n'a rien fini, il n'est ni listé parmi les terminés ni sonné.
+
 ## Le bundle et la barre des menus
 
 L'exécutable principal du bundle **est** l'interpréteur, et l'app démarre par `sitecustomize.py` :

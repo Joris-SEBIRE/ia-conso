@@ -39,6 +39,7 @@ from Cocoa import (
     NSParagraphStyleAttributeName,
     NSRunLoop,
     NSRunLoopCommonModes,
+    NSSound,
     NSStatusBar,
     NSTimer,
     NSVariableStatusItemLength,
@@ -50,6 +51,7 @@ from PyObjCTools import AppHelper
 from . import IDENTITY_TINT, launchagent, shortcuts
 from . import help as manual
 from .activity import Activity, probe as probe_activity
+from .chimes import ATTENTION, FINISHED, Bell
 from .anthropic import fetch as fetch_claude
 from .avatars import Avatars
 from .config import Config
@@ -102,7 +104,8 @@ AVATAR_SIZE = 22.0
 SPINNER_FRAMES = ("◐", "◓", "◑", "◒")
 SPINNER_INTERVAL = 0.13
 BAR_WIDTH = 12
-SHORTCUT_MIN = 84.0
+# Cinq raccourcis : « Démarrage », le plus long, doit tenir dans le sien.
+SHORTCUT_MIN = 94.0
 # « 100 % » : largeur fixe pour aligner les jauges d'un compte à l'autre.
 PERCENT_FIELD = 5
 PERCENT_PAD = " "  # figure space = largeur d'un chiffre
@@ -283,7 +286,7 @@ def _append_activity(text, items, finished=()) -> None:
     """Une ligne par session : son titre, le modèle et l'effort, puis son avancement en gris.
 
     Les sessions terminées suivent, en retrait : celles coupées par une limite d'abord, puisqu'il
-    reste à les relancer, puis celles finies dans l'heure.
+    reste à les relancer, puis celles finies depuis moins de cinq heures.
     """
     now_ms = int(time.time() * 1000)
     for index, item in enumerate(items):
@@ -586,6 +589,7 @@ class IAConsoApp(NSObject):
         self.cfg_mtime = self.config_mtime()
         self.snapshot = Snapshot()
         self.activity = Activity()
+        self.bell = Bell()
         self.activity_rows = []
         self.activity_stop = threading.Event()
         self.avatars = Avatars()
@@ -642,6 +646,7 @@ class IAConsoApp(NSObject):
     def applyActivity_(self, activity) -> None:
         changed = activity != self.activity
         self.activity = activity
+        self.chime(self.bell.feed(activity))
         if changed and not self.show_spinner:
             self.render()
             if self.menu_open:
@@ -941,6 +946,19 @@ class IAConsoApp(NSObject):
             write_status(status)
 
     @objc.python_method
+    def chime(self, sounds: set[str]) -> None:
+        """Un seul son à la fois : l'intervention passe avant la fin d'un tour, sauf si elle est coupée."""
+        if not sounds or not self.cfg.sounds:
+            return
+        name = (self.cfg.sound_attention if ATTENTION in sounds else "") or (
+            self.cfg.sound_finished if FINISHED in sounds else ""
+        )
+        sound = NSSound.soundNamed_(name) if name else None
+        if sound is not None:
+            sound.stop()
+            sound.play()
+
+    @objc.python_method
     def contents(self) -> tuple:
         return (self.snapshot.views, self.snapshot.error, self.activity)
 
@@ -1115,6 +1133,16 @@ class IAConsoApp(NSObject):
             if started:
                 self.footer_active.append(row)
 
+        row = self.add_action(menu, "Sons" + ("  ✓" if self.cfg.sounds else ""), "toggleSounds:", symbol="bell")
+        row.setToolTip_(
+            "Sons : activés, cliquer pour couper"
+            if self.cfg.sounds
+            else "Sons : coupés, cliquer pour les activer"
+        )
+        self.footer_rows.append((row, "bell"))
+        if self.cfg.sounds:
+            self.footer_active.append(row)
+
         row = self.add_action(menu, "Comment ça marche", "openHelp:", ",", "questionmark.circle")
         row.setToolTip_("Comment ça marche (⌘,)")
         self.footer_rows.append((row, "questionmark.circle"))
@@ -1133,6 +1161,8 @@ class IAConsoApp(NSObject):
             short = label.split("   ")[0].split("  ✓")[0]
             if short.startswith("Lancer"):
                 short = "Démarrage"
+            elif short.startswith("Sons"):
+                short = "Sons"
             elif short.startswith("Comment"):
                 short = "Aide"
             elif short.startswith("Quitter"):
@@ -1199,6 +1229,14 @@ class IAConsoApp(NSObject):
             launchagent.disable()
         else:
             launchagent.enable(program)
+        if self.menu_open:
+            self.build_menu(self.menu)
+
+    def toggleSounds_(self, sender):
+        self.reload_config()
+        self.cfg.sounds = not self.cfg.sounds
+        self.cfg.save()
+        self.cfg_mtime = self.config_mtime()
         if self.menu_open:
             self.build_menu(self.menu)
 

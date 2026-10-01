@@ -33,6 +33,11 @@ class Config:
     # L'endpoint de conso est gratuit, mais sans User-Agent Claude Code il tombe en 429.
     # Une minute laisse le pourcentage suivre sans bombarder.
     refresh_seconds: int = 60
+    # Un son quand une session finit son tour, un autre quand elle attend ton intervention. Les
+    # noms sont ceux des sons système (/System/Library/Sounds) ; un nom vide coupe ce son-là.
+    sounds: bool = True
+    sound_finished: str = "Glass"
+    sound_attention: str = "Submarine"
 
     @classmethod
     def load(cls) -> "Config":

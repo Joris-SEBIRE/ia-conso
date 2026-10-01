@@ -401,7 +401,7 @@ def finished_bits(item, now_ms: int) -> list[tuple[str, str]]:
     ended = ago(datetime.fromtimestamp(item.ended_ms / 1000, timezone.utc))
     bits: list[tuple[str, str]] = [("title", item.title.strip() or "session")]
     if not item.halt:
-        return [*bits, ("muted", f"terminée {ended}")]
+        return [*bits, ("muted", f"{'interrompue' if item.is_interrupted else 'terminée'} {ended}")]
     bits += [("halt", halt_label(item)), ("muted", ended)]
     if item.resets_ms > now_ms:
         return [*bits, ("muted", f"reset {pinpoint(datetime.fromtimestamp(item.resets_ms / 1000, timezone.utc))}")]

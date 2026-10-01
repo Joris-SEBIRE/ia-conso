@@ -123,7 +123,22 @@ session en cours, et aucune dans les pastilles :
 - **↻** une session coupée par une limite (`session 5 h pleine`, `semaine pleine`…) ou une erreur \
 d'API : l'heure du reset tant qu'il n'est pas passé, puis **à relancer**. Elle reste listée jusqu'à \
 ce que tu la relances, et au plus un jour après le reset.
-- **✓** une session terminée dans la dernière heure, avec depuis quand.
+- **✓** une session terminée dans les cinq dernières heures, avec depuis quand — ou « interrompue » si \
+c'est toi qui l'as coupée.
+
+## Sons
+
+Deux sons, pour ne pas avoir à surveiller le menu :
+
+- **Glass** quand une session finit son tour : sa réponse est prête à lire. Une session qui a lancé \
+des agents ne sonne qu'une fois, quand le dernier a rendu la main et qu'elle a conclu. Pas de son \
+si c'est toi qui as coupé le tour.
+- **Submarine** quand une session attend ton intervention — une permission, une question, un plan \
+à valider — ou qu'une limite vient de la couper.
+
+L'entrée **Sons** du menu les coupe ou les rétablit. Dans `{config}`, `sound_finished` et \
+`sound_attention` prennent le nom d'un autre son système (`Ping`, `Hero`, `Funk`…) ; un nom vide \
+coupe ce son-là.
 
 ## Réglages
 

@@ -33,6 +33,7 @@ L'app ne fait que lire. Elle ne consomme aucun jeton.
   │ ───────────────────────────────────────────────────────────────  │
   │ ↻  Actualiser   prochaine dans 45 s                              │
   │ ⚡  Lancer au démarrage                                           │
+  │ 🔔  Sons                                                          │
   │ ?  Comment ça marche                                             │
   └──────────────────────────────────────────────────────────────────┘
 ```
@@ -106,8 +107,14 @@ durée. Une session qui attend une réponse passe en rouge.
 Sous les sessions en cours, en retrait, celles qui ne travaillent plus, une ligne par session et
 jamais une session en cours : **↻** pour une session coupée par une limite ou une erreur d'API —
 la limite en rouge, puis l'heure de son reset, ou « à relancer » une fois le reset passé — et
-**✓** pour une session terminée dans l'heure, avec depuis quand. Une session coupée reste listée
-jusqu'à sa relance, et au plus un jour après le reset. Aucune n'entre dans les pastilles.
+**✓** pour une session terminée dans les cinq dernières heures, avec depuis quand — « interrompue » si c'est toi qui
+l'as coupée. Une session coupée reste listée jusqu'à sa relance, et au plus un jour après le reset.
+Aucune n'entre dans les pastilles.
+
+**Sons** : une clochette (`Glass`) quand une session finit son tour — sa réponse est prête — et un
+autre son (`Submarine`) quand une session attend ton intervention (permission, question, plan à
+valider) ou qu'une limite vient de la couper. Une session qui a lancé des agents ne sonne qu'une
+fois, à la fin ; un tour que tu as coupé ne sonne pas. L'entrée **Sons** du menu les coupe.
 
 ## Remises à zéro
 
@@ -130,8 +137,14 @@ n'a plus cours.
 
 ## Réglages
 
-`~/.config/ia-conso/config.json`, clé `refresh_seconds` (60 s par défaut). L'app réécrit le
-fichier s'il manque une clé. Après un échec, elle attend au moins 30 s — et le délai demandé par
+`~/.config/ia-conso/config.json` :
+
+- `refresh_seconds` : le cycle de lecture de la conso (60 s par défaut) ;
+- `sounds` : les sons, activés par défaut — c'est aussi ce que bascule l'entrée **Sons** du menu ;
+- `sound_finished` et `sound_attention` : le nom d'un son système (`/System/Library/Sounds`), un
+  nom vide coupant ce son-là.
+
+L'app réécrit le fichier s'il manque une clé. Après un échec, elle attend au moins 30 s — et le délai demandé par
 Anthropic en cas de 429 — avant de retenter.
 
 ## Ce que l'app écrit
