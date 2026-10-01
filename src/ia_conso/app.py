@@ -57,6 +57,7 @@ from .cursor import fetch as fetch_cursor
 from .formatting import (
     account_title,
     activity_bits,
+    finished_bits,
     age_seconds,
     amounts,
     countdown,
@@ -263,10 +264,27 @@ def _activity_style(role: str, item) -> tuple:
     return NSColor.secondaryLabelColor(), NSFontWeightMedium
 
 
-def _append_activity(text, items) -> None:
-    """Une ligne par session : son titre, le modèle et l'effort, puis son avancement en gris."""
-    if not items:
-        return
+def _finished_style(role: str) -> tuple:
+    """Une session terminée s'efface derrière celles qui tournent ; une coupée signale quoi faire.
+
+    La limite en cause prend le rouge de sa jauge pleine, et « à relancer » la couleur des
+    sessions actives : c'est la seule chose à faire de cette ligne.
+    """
+    if role == "halt":
+        return _colour("systemRedColor"), NSFontWeightSemibold
+    if role == "relaunch":
+        return _colour(IDENTITY_TINT), NSFontWeightSemibold
+    if role == "title":
+        return NSColor.secondaryLabelColor(), NSFontWeightMedium
+    return NSColor.tertiaryLabelColor(), NSFontWeightMedium
+
+
+def _append_activity(text, items, finished=()) -> None:
+    """Une ligne par session : son titre, le modèle et l'effort, puis son avancement en gris.
+
+    Les sessions terminées suivent, en retrait : celles coupées par une limite d'abord, puisqu'il
+    reste à les relancer, puis celles finies dans l'heure.
+    """
     now_ms = int(time.time() * 1000)
     for index, item in enumerate(items):
         arrow = _colour("systemRedColor" if item.is_waiting else IDENTITY_TINT)
@@ -280,6 +298,23 @@ def _append_activity(text, items) -> None:
                     _run(ACTIVITY_SEP, META_FONT, color=NSColor.tertiaryLabelColor(), weight=NSFontWeightMedium)
                 )
             colour, weight = _activity_style(role, item)
+            text.appendAttributedString_(
+                _run(_crop(raw) if role == "title" else raw, META_FONT, color=colour, weight=weight)
+            )
+    for index, item in enumerate(finished):
+        gap = 4.0 if index == 0 and items else (2.0 if index == 0 else 1.0)
+        text.appendAttributedString_(_run("\n", META_FONT, paragraph=_paragraph(before=gap)))
+        if not item.halt:
+            mark, colour = "✓ ", NSColor.tertiaryLabelColor()
+        else:
+            mark, colour = "↻ ", _colour("systemRedColor" if item.resets_ms > now_ms else IDENTITY_TINT)
+        text.appendAttributedString_(_run(mark, META_FONT, color=colour, weight=NSFontWeightSemibold))
+        for position, (role, raw) in enumerate(finished_bits(item, now_ms)):
+            if position:
+                text.appendAttributedString_(
+                    _run(ACTIVITY_SEP, META_FONT, color=NSColor.tertiaryLabelColor(), weight=NSFontWeightMedium)
+                )
+            colour, weight = _finished_style(role)
             text.appendAttributedString_(
                 _run(_crop(raw) if role == "title" else raw, META_FONT, color=colour, weight=weight)
             )
@@ -340,7 +375,7 @@ def _with_counts(face, waiting: str, running: str):
     return canvas
 
 
-def _account_header(view: AccountView, items=()):
+def _account_header(view: AccountView, items=(), finished=()):
     """En-tête d'un compte, Claude ou Cursor : titre, fraîcheur, e-mail, puis son activité."""
     grey = NSColor.secondaryLabelColor()
     tint = _colour(IDENTITY_TINT) if view.is_active else grey
@@ -361,7 +396,7 @@ def _account_header(view: AccountView, items=()):
     )
     if view.email:
         text.appendAttributedString_(_run(f"\n{view.email}", META_FONT, color=grey, paragraph=_paragraph(before=1.0)))
-    _append_activity(text, items)
+    _append_activity(text, items, finished)
     return text
 
 
@@ -928,10 +963,10 @@ class IAConsoApp(NSObject):
         active = next((view for view in claude if view.is_active), None)
         others = [view for view in claude if not view.is_active]
         if active:
-            self.add_account(menu, active, self.activity.claude, live=True)
+            self.add_account(menu, active, live=True)
         for view in snap.of(CURSOR):
             self.add_break(menu)
-            self.add_account(menu, view, self.activity.cursor, live=True)
+            self.add_account(menu, view, live=True)
         # Un compte inactif en détail, le reste replié : le menu reste lisible à 5 comptes.
         if others:
             self.add_break(menu)
@@ -953,14 +988,15 @@ class IAConsoApp(NSObject):
             menu.addItem_(NSMenuItem.separatorItem())
 
     @objc.python_method
-    def add_account(self, menu, view: AccountView, items=(), live: bool = False) -> None:
+    def add_account(self, menu, view: AccountView, live: bool = False) -> None:
         """Un compte : son en-tête, ses jauges, ses extra.
 
         `live` dit que ce compte-là porte l'activité en cours : sans lui, l'en-tête se rafraîchit
         quand même (la fraîcheur vieillit à chaque tick) mais sans se voir greffer les sessions
         d'un autre compte.
         """
-        row = self.add_rich(menu, _account_header(view, items), image=_face(self.avatars, view.email))
+        header = _account_header(view, *self.sessions_of(view, live))
+        row = self.add_rich(menu, header, image=_face(self.avatars, view.email))
         self.activity_rows.append((row, view, live))
         if view.error:
             self.add_info(menu, view.error)
@@ -1009,13 +1045,19 @@ class IAConsoApp(NSObject):
         menu.addItem_(row)
 
     @objc.python_method
+    def sessions_of(self, view: AccountView, live: bool) -> tuple:
+        """(en cours, terminées) que porte l'en-tête de ce compte."""
+        if not live:
+            return (), ()
+        if view.provider == CURSOR:
+            return self.activity.cursor, self.activity.cursor_finished
+        return self.activity.claude, self.activity.claude_finished
+
+    @objc.python_method
     def refresh_live(self) -> None:
-        # « depuis … » recalculé chaque tick sans reconstruire le menu.
+        # « depuis … » et « il y a … » recalculés chaque tick sans reconstruire le menu.
         for item, view, live in self.activity_rows:
-            items = ()
-            if live:
-                items = self.activity.cursor if view.provider == CURSOR else self.activity.claude
-            item.setAttributedTitle_(_account_header(view, items))
+            item.setAttributedTitle_(_account_header(view, *self.sessions_of(view, live)))
         for item in self.menu.itemArray():
             payload = item.representedObject()
             if not isinstance(payload, tuple) or len(payload) != 2:

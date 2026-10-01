@@ -96,8 +96,10 @@ centaines. Deux règles tiennent le coût du sondage — qui tourne à la second
   `LIKE` : l'index unique sur `key` n'est pas utilisé pour un `LIKE` tant que `case_sensitive_like`
   est off, et la requête balaie alors toute la table.
 
-Les sessions sont identifiées par leur PID et les agents Cursor par leur `composerId`, jamais par
-leur titre : deux sessions homonymes sont deux sessions.
+Les sessions sont identifiées par leur `sessionId` et les agents Cursor par leur `composerId`,
+jamais par leur titre : deux sessions homonymes sont deux sessions. Le `sessionId` est aussi ce qui
+relie une session vivante à son transcript, donc à la liste des sessions terminées, et deux process
+qui reprennent la même session n'en font qu'une.
 
 ## Reconnaître le cran « ultracode »
 
@@ -148,6 +150,28 @@ condition de n'ouvrir que les journaux encore chauds : un workflow interrompu la
 « démarrés » pour toujours. Ceux lancés hors workflow, eux, ne sont fermés par rien — l'outil rend
 son résultat dès le lancement, longtemps avant la fin du travail — et se comptent donc par
 l'activité de leur propre transcript.
+
+## Ce qui compte comme « terminée » ou « coupée »
+
+Le fichier de `~/.claude/sessions/` disparaît à la fermeture de Claude Code : seul le transcript
+reste, c'est donc lui qui liste les sessions finies. Sa date ne date rien — Claude Code y réécrit
+titre et dernier prompt à chaque reprise, même sans rien demander. La fin d'une session est celle
+de son dernier tour : le dernier message de l'assistant.
+
+Une erreur d'API s'inscrit elle aussi comme un message de l'assistant, au modèle `<synthetic>`,
+marqué `isApiErrorMessage`, avec le code de l'erreur dans `error`. Pour une limite (`rate_limit`),
+le bloc `quotaLimits` dit laquelle (`rateLimitType` : `five_hour`, `seven_day`…) et quand elle se
+réarme (`resetsAt`). Une session dont le dernier tour est une telle erreur a été coupée ; dès
+qu'elle est relancée, un vrai message suit et elle redevient une session comme les autres. Ce
+message synthétique n'a ni modèle ni usage : il date la fin du tour, sans effacer le modèle et le
+contexte du tour précédent.
+
+Les messages marqués `isSidechain` sont ceux d'un agent : ni leur modèle, ni leur fin, ni leur
+coupure ne sont ceux de la session.
+
+Côté Cursor, un composer qui n'a pas bougé depuis la fenêtre de fraîcheur ne peut plus être en
+cours : il est terminé à sa dernière mise à jour. Un brouillon, ou un composer sans nom, n'a jamais
+rien fait et n'est pas listé.
 
 ## Le bundle et la barre des menus
 

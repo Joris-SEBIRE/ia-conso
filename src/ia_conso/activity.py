@@ -23,6 +23,12 @@ from .paths import CLAUDE_PROJECTS, CLAUDE_SESSIONS, CURSOR_STATE_DB as STATE_DB
 
 # Fenêtre de fraîcheur d'un run Cursor (lastUpdatedAt / startedAtMs outil).
 RUN_HOT_SECONDS = 15 * 60
+# Une session terminée reste visible une heure, le temps de savoir ce qui vient de finir.
+RECENT_SECONDS = 60 * 60
+# Une session coupée par une limite reste à relancer : visible jusqu'à sa relance, et au plus un
+# jour après le reset de la limite. Une limite hebdo peut tomber jusqu'à sept jours plus tard.
+HALTED_KEEP_SECONDS = 86400
+HALTED_SCAN_SECONDS = 7 * 86400 + HALTED_KEEP_SECONDS
 # Un outil commencé il y a plus longtemps n'est plus « en cours ».
 TOOL_HOT_SECONDS = 5 * 60
 # Le fichier de session n'est réécrit qu'au changement de statut : son âge ne dit pas si la
@@ -54,6 +60,8 @@ ULTRA_OVERLAP = 256
 # transcript bouge. Il peut donc disparaître un instant s'il réfléchit longtemps sans écrire.
 AGENT_IDLE_SECONDS = 120
 AGENT_CLOSED = frozenset({"result", "failed", "skipped", "cancelled"})
+# Un prompt sert de titre de repli : au-delà, il ne tiendrait sur aucune ligne.
+PROMPT_MAX = 120
 # Les transcripts nomment le modèle en clair : on ne garde que ce qui se lit dans un menu.
 MODEL_WORDS = ("opus", "sonnet", "haiku", "fable")
 
@@ -86,7 +94,14 @@ class SessionDetails:
     model: str = ""
     effort: str = ""
     context_tokens: int = 0
-    is_ultra: bool = False
+    # Le dernier prompt, pour nommer une session trop courte pour avoir reçu un titre.
+    last_prompt: str = ""
+    # Fin du dernier tour : le dernier message de l'assistant, en epoch ms.
+    ended_ms: int = 0
+    # Si ce dernier message est une erreur d'API : son code, la limite en cause et son reset.
+    halt: str = ""
+    limit: str = ""
+    resets_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -108,9 +123,26 @@ class ActivityItem:
 
 
 @dataclass(frozen=True)
+class FinishedItem:
+    """Une session qui ne travaille plus : finie normalement, ou coupée par une erreur d'API."""
+
+    key: str
+    title: str
+    ended_ms: int
+    # Code de l'erreur qui a coupé le dernier tour (`rate_limit`…), vide pour une fin normale.
+    halt: str = ""
+    # Pour une limite : laquelle (`five_hour`, `seven_day`…) et quand elle se réarme.
+    limit: str = ""
+    resets_ms: int = 0
+
+
+@dataclass(frozen=True)
 class Activity:
     claude: tuple[ActivityItem, ...] = ()
     cursor: tuple[ActivityItem, ...] = ()
+    # Ce qui a fini récemment : affiché pour mémoire, jamais compté dans les pastilles.
+    claude_finished: tuple[FinishedItem, ...] = ()
+    cursor_finished: tuple[FinishedItem, ...] = ()
 
     @property
     def items(self) -> tuple[ActivityItem, ...]:
@@ -282,9 +314,13 @@ def _transcript(session_id: str, cwd: str) -> Path | None:
 
 
 def _read_session(path: Path) -> SessionDetails:
-    """Titre, modèle, effort, contexte et agents ouverts, en une passe sur la queue du transcript."""
-    custom = ai = model = effort = ""
-    context = 0
+    """Titre, modèle, effort, contexte et fin du dernier tour, en une passe sur la queue du transcript.
+
+    Une erreur d'API s'inscrit comme un message de l'assistant, au modèle `<synthetic>` et sans
+    usage : elle date la fin du tour mais ne dit rien du modèle ni du contexte.
+    """
+    custom = ai = model = effort = prompt = halt = limit = ""
+    context = ended = resets = 0
     for line in _tail(path).split("\n"):
         if "{" not in line:
             continue
@@ -301,7 +337,19 @@ def _read_session(path: Path) -> SessionDetails:
         if kind == "ai-title":
             ai = str(event.get("aiTitle") or "").strip() or ai
             continue
-        if kind == "assistant":
+        if kind == "last-prompt":
+            prompt = " ".join(str(event.get("lastPrompt") or "").split())[:PROMPT_MAX] or prompt
+            continue
+        # Un message d'agent n'est ni le modèle, ni la fin, ni la coupure de la session elle-même.
+        if kind == "assistant" and not event.get("isSidechain"):
+            ended = _as_ms(event.get("timestamp")) or ended
+            if event.get("isApiErrorMessage"):
+                quota = event.get("quotaLimits") if isinstance(event.get("quotaLimits"), dict) else {}
+                halt = str(event.get("error") or "unknown")
+                limit = str(quota.get("rateLimitType") or "")
+                resets = _as_ms(quota.get("resetsAt"))
+                continue
+            halt, limit, resets = "", "", 0
             message = event.get("message") if isinstance(event.get("message"), dict) else {}
             model = str(message.get("model") or "") or model
             effort = str(event.get("perTurnEffort") or event.get("effort") or "") or effort
@@ -316,26 +364,25 @@ def _read_session(path: Path) -> SessionDetails:
         model=_model_label(model),
         effort=effort,
         context_tokens=context,
+        last_prompt=prompt,
+        ended_ms=ended,
+        halt=halt,
+        limit=limit,
+        resets_ms=resets,
     )
 
 
-def _session_details(session_id: str, cwd: str) -> SessionDetails:
-    path = _transcript(session_id, cwd)
+def _session_details(session_id: str, path: Path | None, mtime: float | None = None) -> SessionDetails:
     if path is None:
         return SessionDetails()
     try:
-        mtime = path.stat().st_mtime
+        mtime = path.stat().st_mtime if mtime is None else mtime
     except OSError:
         return SessionDetails()
-    try:
-        size = path.stat().st_size
-    except OSError:
-        size = 0
-    ultra = _ultra_state(session_id, path, size)
     cached = _session_cache.get(session_id)
     if cached and cached[0] == mtime:
-        return replace(cached[1], is_ultra=ultra)
-    details = replace(_read_session(path), is_ultra=ultra)
+        return cached[1]
+    details = _read_session(path)
     if not details.title and cached:
         # Le titre peut être plus vieux que la queue relue : on garde le dernier connu.
         details = replace(details, title=cached[1].title)
@@ -416,10 +463,14 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _claude_sessions() -> tuple[ActivityItem, ...]:
-    """Sessions Claude Code vivantes et non idle, une ligne par session."""
+    """Sessions Claude Code vivantes et non idle, une ligne par session.
+
+    Une session se reconnaît à son `sessionId` : c'est lui qui la relie à son transcript, donc à
+    la liste des sessions terminées, et deux process qui reprennent la même session n'en font qu'une.
+    """
     if not CLAUDE_SESSIONS.is_dir():
         return ()
-    items: list[ActivityItem] = []
+    items: dict[str, ActivityItem] = {}
     stale_before = time.time() - SESSION_STALE_SECONDS
     try:
         paths = sorted(CLAUDE_SESSIONS.glob("*.json"))
@@ -448,30 +499,83 @@ def _claude_sessions() -> tuple[ActivityItem, ...]:
         agents = _workflow_agents(session_id) + _loose_agents(session_id)
         transcript = _transcript(session_id, cwd)
         try:
-            background = _background_tasks(session_id, transcript, transcript.stat().st_size) if transcript else 0
+            size = transcript.stat().st_size if transcript else 0
         except OSError:
-            background = 0
+            size = 0
+        background = _background_tasks(session_id, transcript, size) if size else 0
         # « idle » veut dire « attend l'utilisateur », pas « ne fait rien » : une session qui a rendu
         # la main pendant que ses agents ou une commande de fond travaillent est encore à l'œuvre.
         if status in CLAUDE_IDLE and not (agents or background):
             continue
-        details = _session_details(session_id, cwd)
+        key = session_id or f"pid:{pid}"
+        if key in items:
+            continue
+        details = _session_details(session_id, transcript)
         started = _as_ms(blob.get("startedAt") or 0)
-        items.append(
-            ActivityItem(
-                key=str(pid),
-                title=details.title or str(blob.get("name") or "").strip() or path.stem,
-                since_ms=_as_ms(blob.get("statusUpdatedAt") or started) or started,
-                is_waiting=status in CLAUDE_WAITING,
-                model=details.model,
-                effort=details.effort,
-                is_ultra=details.is_ultra,
-                agents=agents,
-                background=background,
-                context_tokens=details.context_tokens,
-            )
+        items[key] = ActivityItem(
+            key=key,
+            title=details.title or str(blob.get("name") or "").strip() or details.last_prompt or path.stem,
+            since_ms=_as_ms(blob.get("statusUpdatedAt") or started) or started,
+            is_waiting=status in CLAUDE_WAITING,
+            model=details.model,
+            effort=details.effort,
+            is_ultra=_ultra_state(session_id, transcript, size) if size else False,
+            agents=agents,
+            background=background,
+            context_tokens=details.context_tokens,
         )
-    return tuple(items)
+    return tuple(items.values())
+
+
+def _transcripts(since: float) -> list[tuple[Path, float]]:
+    """(transcript, mtime) des sessions modifiées depuis `since` (epoch s) — les agents sont plus bas."""
+    found: list[tuple[Path, float]] = []
+    try:
+        projects = [entry.path for entry in os.scandir(CLAUDE_PROJECTS) if entry.is_dir()]
+    except OSError:
+        return found
+    for project in projects:
+        try:
+            with os.scandir(project) as entries:
+                for entry in entries:
+                    if entry.name.endswith(".jsonl") and entry.is_file() and (mtime := entry.stat().st_mtime) >= since:
+                        found.append((Path(entry.path), mtime))
+        except OSError:
+            continue
+    return found
+
+
+def _claude_finished(running: set[str]) -> tuple[FinishedItem, ...]:
+    """Sessions qui ne travaillent plus : finies dans l'heure, ou coupées et pas encore relancées.
+
+    Le transcript reste quand la session se ferme, c'est donc lui qui fait foi, et la fin d'une
+    session est celle de son dernier tour : la date du fichier bouge encore à sa reprise. Une
+    session en cours n'y figure jamais ; une session coupée en tête, parce qu'elle est à relancer.
+    """
+    now_ms = int(time.time() * 1000)
+    finished: dict[str, FinishedItem] = {}
+    for path, mtime in _transcripts(now_ms / 1000 - HALTED_SCAN_SECONDS):
+        session_id = path.stem
+        if session_id in running:
+            continue
+        details = _session_details(session_id, path, mtime)
+        if not details.ended_ms:
+            continue
+        if details.halt:
+            shown_until = max(details.ended_ms, details.resets_ms) + HALTED_KEEP_SECONDS * 1000
+        else:
+            shown_until = details.ended_ms + RECENT_SECONDS * 1000
+        if shown_until < now_ms or details.ended_ms <= finished.get(session_id, FinishedItem("", "", 0)).ended_ms:
+            continue
+        finished[session_id] = FinishedItem(
+            key=session_id,
+            title=details.title or details.last_prompt or "session",
+            ended_ms=details.ended_ms,
+            halt=details.halt,
+            limit=details.limit,
+            resets_ms=details.resets_ms,
+        )
+    return tuple(sorted(finished.values(), key=lambda item: (not item.halt, -item.ended_ms)))
 
 
 def _cursor_run_signals(blob: dict, header: dict, now_ms: int) -> tuple[bool, bool, int, int]:
@@ -552,22 +656,29 @@ def _cursor_pending_approval(con: sqlite3.Connection, composer_id: str, now_ms: 
     return 0
 
 
-def _cursor_agents() -> tuple[ActivityItem, ...]:
-    """Agents Cursor locaux : une ligne par composer, identifiée par son composerId."""
+def _cursor_agents() -> tuple[tuple[ActivityItem, ...], tuple[FinishedItem, ...]]:
+    """Agents Cursor locaux, en cours puis terminés dans l'heure, identifiés par leur composerId.
+
+    Un composer qui n'a pas bougé depuis la fenêtre de fraîcheur ne peut plus être en cours : il
+    est terminé sans qu'on ait à charger son composerData. Un brouillon, ou un composer qui n'a pas
+    encore reçu de nom, n'a jamais rien fait.
+    """
     if not STATE_DB.exists():
-        return ()
+        return (), ()
     try:
         con = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=0.25)
     except sqlite3.Error:
-        return ()
+        return (), ()
     now_ms = int(time.time() * 1000)
     cutoff = now_ms - RUN_HOT_SECONDS * 1000
+    recent = now_ms - RECENT_SECONDS * 1000
     items: list[ActivityItem] = []
+    finished: list[FinishedItem] = []
     try:
         headers = con.execute(
             "SELECT composerId, lastUpdatedAt, value FROM composerHeaders "
             "WHERE IFNULL(isArchived, 0) = 0 AND IFNULL(lastUpdatedAt, 0) >= ?",
-            (cutoff,),
+            (recent,),
         ).fetchall()
         for composer_id, last_updated, value in headers:
             try:
@@ -578,7 +689,12 @@ def _cursor_agents() -> tuple[ActivityItem, ...]:
                 header = {}
             cid = str(composer_id)
             touched = _as_ms(last_updated or header.get("lastUpdatedAt") or 0)
+            name = str(header.get("name") or "").strip()
+            if touched < recent:
+                continue
             if touched < cutoff:
+                if name and not header.get("isDraft"):
+                    finished.append(FinishedItem(key=cid, title=name, ended_ms=touched))
                 continue
             blob = {}
             try:
@@ -597,6 +713,9 @@ def _cursor_agents() -> tuple[ActivityItem, ...]:
                     wait_since = pending_since
                     run_since = run_since or pending_since
             if not running:
+                name = str(blob.get("name") or "").strip() or name
+                if name and not header.get("isDraft"):
+                    finished.append(FinishedItem(key=cid, title=name, ended_ms=touched))
                 continue
             config = blob.get("modelConfig") if isinstance(blob.get("modelConfig"), dict) else {}
             model = str(config.get("modelName") or "")
@@ -613,10 +732,13 @@ def _cursor_agents() -> tuple[ActivityItem, ...]:
                 )
             )
     except sqlite3.Error:
-        return ()
+        return (), ()
     finally:
         con.close()
-    return tuple(sorted(items, key=lambda item: item.key))
+    return (
+        tuple(sorted(items, key=lambda item: item.key)),
+        tuple(sorted(finished, key=lambda item: -item.ended_ms)),
+    )
 
 
 def _agent_state(agent: dict) -> tuple[bool, bool]:
@@ -678,5 +800,12 @@ def _cursor_cloud() -> tuple[ActivityItem, ...]:
 
 
 def probe() -> Activity:
-    cursor = {item.key: item for item in (*_cursor_cloud(), *_cursor_agents())}
-    return Activity(claude=_claude_sessions(), cursor=tuple(cursor[key] for key in sorted(cursor)))
+    claude = _claude_sessions()
+    local, ended = _cursor_agents()
+    cursor = {item.key: item for item in (*_cursor_cloud(), *local)}
+    return Activity(
+        claude=claude,
+        cursor=tuple(cursor[key] for key in sorted(cursor)),
+        claude_finished=_claude_finished({item.key for item in claude}),
+        cursor_finished=tuple(item for item in ended if item.key not in cursor),
+    )

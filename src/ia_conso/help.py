@@ -117,6 +117,14 @@ Une session en attente est comptée comme telle, pas comme active : elle ne cons
 t'a rendu la main pendant qu'une commande de fond ou des agents travaillent reste affichée, \
 avec le nombre de tâches de fond en cours.
 
+En dessous, en retrait, les sessions qui ne travaillent plus — une ligne par session, jamais une \
+session en cours, et aucune dans les pastilles :
+
+- **↻** une session coupée par une limite (`session 5 h pleine`, `semaine pleine`…) ou une erreur \
+d'API : l'heure du reset tant qu'il n'est pas passé, puis **à relancer**. Elle reste listée jusqu'à \
+ce que tu la relances, et au plus un jour après le reset.
+- **✓** une session terminée dans la dernière heure, avec depuis quand.
+
 ## Réglages
 
 Le cycle se règle dans `{config}`, clé `refresh_seconds` (60 s par défaut). L'app réécrit \

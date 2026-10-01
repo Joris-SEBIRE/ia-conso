@@ -374,6 +374,44 @@ def activity_detail(item, now_ms: int) -> str:
     return "  ·  ".join(text for _, text in activity_bits(item, now_ms))
 
 
+# Les limites telles que les jauges les nomment, pour qu'une session coupée se recoupe avec elles.
+LIMIT_LABELS = {
+    "five_hour": "session 5 h",
+    "seven_day": "semaine",
+    "seven_day_opus": "semaine Opus",
+    "seven_day_sonnet": "semaine Sonnet",
+}
+HALT_LABELS = {"authentication_failed": "authentification perdue", "server_error": "erreur serveur"}
+
+
+def halt_label(item) -> str:
+    """Ce qui a coupé une session : « session 5 h pleine », « erreur serveur »…"""
+    if item.halt != "rate_limit":
+        return HALT_LABELS.get(item.halt, "erreur d'API")
+    label = LIMIT_LABELS.get(item.limit)
+    return f"{label} pleine" if label else "limite atteinte"
+
+
+def finished_bits(item, now_ms: int) -> list[tuple[str, str]]:
+    """Les morceaux d'une ligne de session terminée.
+
+    Une fin normale ne dit que depuis quand. Une session coupée dit par quoi, et ce qu'il reste à
+    faire : attendre le reset de la limite, ou la relancer.
+    """
+    ended = ago(datetime.fromtimestamp(item.ended_ms / 1000, timezone.utc))
+    bits: list[tuple[str, str]] = [("title", item.title.strip() or "session")]
+    if not item.halt:
+        return [*bits, ("muted", f"terminée {ended}")]
+    bits += [("halt", halt_label(item)), ("muted", ended)]
+    if item.resets_ms > now_ms:
+        return [*bits, ("muted", f"reset {pinpoint(datetime.fromtimestamp(item.resets_ms / 1000, timezone.utc))}")]
+    return [*bits, ("relaunch", "à relancer")]
+
+
+def finished_detail(item, now_ms: int) -> str:
+    return "  ·  ".join(text for _, text in finished_bits(item, now_ms))
+
+
 def _view_lines(view: AccountView) -> list[str]:
     lines = [f"{account_title(view.name, view.plan)}  {freshness_label(view.is_active, view.fetched_at)}"]
     if view.error:
@@ -420,4 +458,6 @@ def dump(snapshot: Snapshot, activity=None) -> str:
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         for item in activity.items:
             lines.append(f"  {activity_detail(item, now_ms)}")
+        for item in (*activity.claude_finished, *activity.cursor_finished):
+            lines.append(f"  {'↻' if item.halt else '✓'} {finished_detail(item, now_ms)}")
     return "\n".join(lines).strip() or "aucune donnée"

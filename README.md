@@ -17,6 +17,8 @@ L'app ne fait que lire. Elle ne consomme aucun jeton.
   │     joris.sebire@spacefill.fr                                    │
   │     → revue ia-conso · Opus 5 · Ultracode · 3 agents             │
   │       · contexte 325 k · depuis 17 min                           │
+  │     ↻ SPA-8285 · session 5 h pleine · il y a 12 min · reset 14:10│
+  │     ✓ revue PR backend · terminée il y a 24 min                  │
   │ ◷  SESSION 5 H  ·  reset dans 3 h 34 min · 19:30                 │
   │     57 %  ███████░░░░░                                           │
   │ ◔  SEMAINE  ·  reset dans 3 j 12 h · lun. à 04:00                │
@@ -100,6 +102,12 @@ pour Opus, turquoise pour Sonnet, vert pour Haiku, indigo pour Fable — puis l'
 Claude Code l'écrit — `Low`, `Medium`, `High`, `Extra high`, `Max`, ou `Ultracode` quand c'est le
 sixième cran du sélecteur qui est armé, et enfin en gris ce qui décrit l'avancement : agents en vol, contexte occupé,
 durée. Une session qui attend une réponse passe en rouge.
+
+Sous les sessions en cours, en retrait, celles qui ne travaillent plus, une ligne par session et
+jamais une session en cours : **↻** pour une session coupée par une limite ou une erreur d'API —
+la limite en rouge, puis l'heure de son reset, ou « à relancer » une fois le reset passé — et
+**✓** pour une session terminée dans l'heure, avec depuis quand. Une session coupée reste listée
+jusqu'à sa relance, et au plus un jour après le reset. Aucune n'entre dans les pastilles.
 
 ## Remises à zéro
 
