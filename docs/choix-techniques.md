@@ -183,9 +183,17 @@ lancement ne sonne jamais.
 à `idle`. C'est le statut de Claude Code qui fait foi : il garde la session `busy` tant que ses
 agents ou son workflow tournent, et son `idle` est la vraie fin du tour — une session qui a lancé
 des agents sonne donc une fois, à la fin. Le comptage d'agents de l'app, qui les retient encore un
-moment après leur dernière écriture, sert à l'affichage, pas au son. Une commande de fond ne
-retient pas le son non plus : un serveur lancé en arrière-plan ne s'arrête jamais, et la réponse
-est déjà là. En terminal, Claude Code écrit `shell` pour cet état-là : c'est un `idle`.
+moment après leur dernière écriture, sert à l'affichage, pas au son.
+
+Une commande lancée en fond, elle, ne garde pas la session `busy` : Claude Code rend la main
+aussitôt, et la session attend la notification de fin pour conclure — « je reviens dès que le
+script a fini ». Ce tour-là n'a rien fini. Une commande lancée en fond depuis le dernier prompt
+humain (`origin.kind: "human"`) et pas encore notifiée retient donc le son, et la session sonne au
+tour que sa notification déclenche. Une commande lancée lors d'un tour précédent — un serveur, qui
+ne s'arrête jamais — ne retient pas la réponse au prompt suivant. Une commande jamais notifiée ne
+sonne pas non plus en cessant d'être comptée : la session ne sonne qu'après un tour qu'on l'a vue
+travailler. En terminal, Claude Code écrit `shell` pour une session au repos pendant une commande
+de fond : c'est un `idle`.
 
 La session doit être lue revenue au calme, pas seulement absente : un fichier de session lu au
 moment où Claude Code le réécrit disparaît le temps d'un sondage, et n'a rien fini pour autant.

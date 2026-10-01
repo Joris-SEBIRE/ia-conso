@@ -131,8 +131,8 @@ c'est toi qui l'as coupée.
 Deux sons, pour ne pas avoir à surveiller le menu :
 
 - **Glass** quand une session finit son tour : sa réponse est prête à lire. Une session qui a lancé \
-des agents ne sonne qu'une fois, quand le dernier a rendu la main et qu'elle a conclu. Pas de son \
-si c'est toi qui as coupé le tour.
+des agents, ou une commande de fond pour ce tour, ne sonne qu'une fois, quand ils ont fini et \
+qu'elle a conclu. Pas de son si c'est toi qui as coupé le tour.
 - **Submarine** quand une session attend ton intervention — une permission, une question, un plan \
 à valider — ou qu'une limite vient de la couper.
 

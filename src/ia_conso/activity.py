@@ -90,10 +90,12 @@ BACKGROUND_LAUNCH = re.compile(
 BACKGROUND_HINTS = ("Command running in background", "moved to the background")
 BACKGROUND_NOTICE = "<task-notification>"
 BACKGROUND_ID = re.compile(r"<task-id>([^<]+)</task-id>")
+# Un prompt tapé par l'utilisateur, et non une notification que Claude Code lui-même envoie.
+HUMAN_PROMPT = '"origin":{"kind":"human"}'
 # Une commande jamais notifiée (session tuée, notification perdue) ne compte plus au-delà.
 BACKGROUND_STALE_SECONDS = 2 * 3600
-# session → (octets lus, lancées {id: epoch s}, notifiées)
-_background_cache: dict[str, tuple[int, dict[str, float], set[str]]] = {}
+# session → (octets lus, lancées {id: epoch s}, notifiées, dernier prompt humain en epoch s)
+_background_cache: dict[str, tuple[int, dict[str, float], set[str], float]] = {}
 _agents_cache: dict[str, tuple[tuple, int]] = {}
 
 
@@ -254,15 +256,18 @@ def _notice_ids(text: str) -> set[str]:
     return set(BACKGROUND_ID.findall(text)) if text.lstrip().startswith(BACKGROUND_NOTICE) else set()
 
 
-def _scan_background(chunk: bytes, launched: dict[str, float], notified: set[str]) -> None:
-    """Relève les lancements en arrière-plan et leurs notifications de fin.
+def _scan_background(chunk: bytes, launched: dict[str, float], notified: set[str]) -> float:
+    """Relève les lancements en arrière-plan, leurs notifications de fin, et le dernier prompt humain.
 
     On ne retient que les traces laissées par Claude Code lui-même : un résultat d'outil qui
-    commence par l'accusé de lancement, une notification en tête de message. Une session qui
-    cite ces textes dans ses propres sorties ne fabrique ainsi aucune fausse tâche.
+    commence par l'accusé de lancement, une notification en tête de message, un prompt marqué
+    humain. Une session qui cite ces textes dans ses propres sorties ne fabrique ainsi aucune
+    fausse tâche.
     """
+    prompted = 0.0
     for line in chunk.decode("utf-8", errors="ignore").split("\n"):
-        if BACKGROUND_NOTICE not in line and not any(hint in line for hint in BACKGROUND_HINTS):
+        is_prompt = HUMAN_PROMPT in line
+        if not is_prompt and BACKGROUND_NOTICE not in line and not any(hint in line for hint in BACKGROUND_HINTS):
             continue
         try:
             event = json.loads(line)
@@ -270,6 +275,9 @@ def _scan_background(chunk: bytes, launched: dict[str, float], notified: set[str
             continue
         if not isinstance(event, dict):
             continue
+        origin = event.get("origin") if isinstance(event.get("origin"), dict) else {}
+        if is_prompt and event.get("type") == "user" and origin.get("kind") == "human":
+            prompted = _as_ms(event.get("timestamp")) / 1000 or time.time()
         if event.get("type") == "queue-operation":
             notified |= _notice_ids(str(event.get("content") or ""))
             continue
@@ -289,24 +297,30 @@ def _scan_background(chunk: bytes, launched: dict[str, float], notified: set[str
                     text = " ".join(str(part.get("text") or "") for part in text if isinstance(part, dict))
                 if match := BACKGROUND_LAUNCH.match(str(text or "")):
                     launched[match.group(1)] = _as_ms(event.get("timestamp")) / 1000 or time.time()
+    return prompted
 
 
-def _background_tasks(session_id: str, path: Path, size: int) -> int:
-    """Commandes en arrière-plan encore en cours : lancées, jamais notifiées, et récentes."""
-    seen, launched, notified = _background_cache.get(session_id, (0, {}, set()))
+def _background_tasks(session_id: str, path: Path, size: int) -> tuple[int, int]:
+    """Commandes en arrière-plan encore en cours : toutes, puis celles lancées depuis le dernier prompt.
+
+    La seconde valeur compte celles que la session attend pour conclure ce tour-ci. Un serveur lancé lors
+    d'un tour précédent tourne toujours, mais la réponse au prompt suivant n'en dépend pas.
+    """
+    seen, launched, notified, prompted = _background_cache.get(session_id, (0, {}, set(), 0.0))
     if not seen or size < seen:
         # Première lecture, ou fichier réécrit : on remonte depuis la fin, sans dépasser la borne.
-        seen, launched, notified = max(0, size - ULTRA_SCAN_MAX), {}, set()
+        seen, launched, notified, prompted = max(0, size - ULTRA_SCAN_MAX), {}, set(), 0.0
     if size > seen:
         chunk = _read_at(path, seen, size)
         # Une ligne en cours d'écriture sera relue entière au passage suivant.
         cut = chunk.rfind(b"\n")
         if cut >= 0:
-            _scan_background(chunk[: cut + 1], launched, notified)
+            prompted = _scan_background(chunk[: cut + 1], launched, notified) or prompted
             seen += cut + 1
-    _background_cache[session_id] = (seen, launched, notified)
+    _background_cache[session_id] = (seen, launched, notified, prompted)
     horizon = time.time() - BACKGROUND_STALE_SECONDS
-    return sum(1 for task, at in launched.items() if task not in notified and at >= horizon)
+    running = [at for task, at in launched.items() if task not in notified and at >= horizon]
+    return len(running), sum(1 for at in running if at >= prompted)
 
 
 def _model_label(name: str) -> str:
@@ -503,8 +517,6 @@ def _claude_sessions() -> tuple[tuple[ActivityItem, ...], frozenset[str]]:
 
     Une session se reconnaît à son `sessionId` : c'est lui qui la relie à son transcript, donc à
     la liste des sessions terminées, et deux process qui reprennent la même session n'en font qu'une.
-    Une session qui a rendu la main a fini son travail, même si une commande de fond tourne encore :
-    un serveur lancé en arrière-plan ne s'arrête jamais de lui-même.
     """
     if not CLAUDE_SESSIONS.is_dir():
         return (), frozenset()
@@ -544,11 +556,13 @@ def _claude_sessions() -> tuple[tuple[ActivityItem, ...], frozenset[str]]:
             size = transcript.stat().st_size if transcript else 0
         except OSError:
             size = 0
-        background = _background_tasks(session_id, transcript, size) if size else 0
+        background, pending = _background_tasks(session_id, transcript, size) if size else (0, 0)
         key = session_id or f"pid:{pid}"
         # Claude Code garde la session « busy » tant que ses agents ou son workflow tournent : son
-        # « idle » est la vraie fin du tour, que les agents comptés ici soient retombés ou non.
-        if status in CLAUDE_IDLE:
+        # « idle » est la vraie fin du tour, que les agents comptés ici soient retombés ou non. Il
+        # la rend « idle » en revanche pendant une commande lancée en fond pour ce tour : la session
+        # attend son résultat pour conclure, elle n'a pas fini.
+        if status in CLAUDE_IDLE and not pending:
             settled.add(key)
         elif status not in CLAUDE_WAITING:
             busy.add(key)

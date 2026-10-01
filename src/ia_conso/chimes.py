@@ -41,6 +41,13 @@ class Bell:
             sounds.add(ATTENTION)
         self.halts |= halts
         self.armed |= {item.key for item in activity.items if item.is_busy}
+        # Une session qui rend la main en attendant une commande lancée pour ce tour n'a pas fini :
+        # elle sonnera au tour suivant, celui que la fin de la commande déclenche.
+        self.armed -= {
+            item.key
+            for item in activity.items
+            if not (item.is_busy or item.is_waiting) and item.key not in activity.settled
+        }
         for key in self.armed & activity.settled:
             self.armed.discard(key)
             done = ended.get(key)

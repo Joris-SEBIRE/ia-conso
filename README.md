@@ -113,8 +113,9 @@ Aucune n'entre dans les pastilles.
 
 **Sons** : une clochette (`Glass`) quand une session finit son tour — sa réponse est prête — et un
 autre son (`Submarine`) quand une session attend ton intervention (permission, question, plan à
-valider) ou qu'une limite vient de la couper. Une session qui a lancé des agents ne sonne qu'une
-fois, à la fin ; un tour que tu as coupé ne sonne pas. L'entrée **Sons** du menu les coupe.
+valider) ou qu'une limite vient de la couper. Une session qui a lancé des agents, ou une commande
+de fond pour ce tour, ne sonne qu'une fois, à la fin ; un tour que tu as coupé ne sonne pas.
+L'entrée **Sons** du menu les coupe.
 
 ## Remises à zéro
 
