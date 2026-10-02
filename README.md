@@ -15,10 +15,10 @@ L'app ne fait que lire. Elle ne consomme aucun jeton.
   ┌──────────────────────────────────────────────────────────────────┐
   │ ☺  Spacefill · Claude Team        ·  actif à l'instant            │
   │     joris.sebire@spacefill.fr                                    │
-  │     → revue ia-conso · Opus 5 · Ultracode · 3 agents             │
-  │       · contexte 325 k · depuis 17 min                           │
+  │     → revue ia-conso · Opus 5 1M · Extra high · Ultracode        │
+  │       · Thinking · 3 agents · contexte 325 k · depuis 17 min     │
   │     ↻ SPA-8285 · session 5 h pleine · il y a 12 min · reset 14:10│
-  │     ✓ revue PR backend · terminée il y a 24 min                  │
+  │     ✓ revue PR · Sonnet 5 · Medium · terminée il y a 24 min      │
   │ ◷  SESSION 5 H  ·  reset dans 3 h 34 min · 19:30                 │
   │     57 %  ███████░░░░░                                           │
   │ ◔  SEMAINE  ·  reset dans 3 j 12 h · lun. à 04:00                │
@@ -99,17 +99,20 @@ contexte occupé et les agents encore en vol ; la base d'état de Cursor donne s
 modèle et ceux qui attendent une approbation.
 
 Chaque ligne se lit dans cet ordre : le titre, puis le **modèle** — couleur par famille, violet
-pour Opus, turquoise pour Sonnet, vert pour Haiku, indigo pour Fable — puis l'**effort**, écrit comme
-Claude Code l'écrit — `Low`, `Medium`, `High`, `Extra high`, `Max`, ou `Ultracode` quand c'est le
-sixième cran du sélecteur qui est armé, et enfin en gris ce qui décrit l'avancement : agents en vol, contexte occupé,
-durée. Une session qui attend une réponse passe en rouge.
+pour Opus, turquoise pour Sonnet, vert pour Haiku, indigo pour Fable, suivi de `1M` pour le contexte
+d'un million de tokens — puis l'**effort**, écrit comme Claude Code l'écrit — `Low`, `Medium`,
+`High`, `Extra high`, `Max` — puis les **options** actives, plus pâles : `Ultracode`, `Thinking`,
+`Fast`, `Advisor` suivi de son modèle quand il en consulte un autre que celui de la session, `Plan`.
+Enfin, en gris, ce qui décrit l'avancement : agents en vol, contexte occupé, durée. Une session qui
+attend une réponse passe en rouge.
 
 Sous les sessions en cours, en retrait, celles qui ne travaillent plus, une ligne par session et
 jamais une session en cours : **↻** pour une session coupée par une limite ou une erreur d'API —
 la limite en rouge, puis l'heure de son reset, ou « à relancer » une fois le reset passé — et
-**✓** pour une session terminée dans les cinq dernières heures, avec depuis quand — « interrompue » si c'est toi qui
-l'as coupée. Une session coupée reste listée jusqu'à sa relance, et au plus un jour après le reset.
-Aucune n'entre dans les pastilles.
+**✓** pour une session terminée dans les cinq dernières heures, avec depuis quand — « interrompue »
+si c'est toi qui l'as coupée. Chacune garde le modèle, l'effort et les options de son dernier tour,
+lus dans son propre transcript, en retrait. Une session coupée reste listée jusqu'à sa relance, et
+au plus un jour après le reset. Aucune n'entre dans les pastilles.
 
 **Sons** : une clochette (`Glass`) quand une session finit son tour — sa réponse est prête — et un
 autre son (`Submarine`) quand une session attend ton intervention (permission, question, plan à

@@ -106,8 +106,9 @@ qui reprennent la même session n'en font qu'une.
 Le sélecteur d'effort de Claude Code a six crans pour cinq niveaux : le sixième, « Ultracode »,
 pose l'effort à `xhigh` — le quatrième — et arme en plus l'orchestration de workflows. Le transcript
 n'écrit donc que `xhigh`, alors que le curseur de l'utilisateur est au bout : sans ce marqueur, son
-sélecteur et le menu se contrediraient. Les crans sont d'ailleurs affichés sous le libellé même de
-Claude Code, pour qu'il n'y ait rien à convertir de tête.
+sélecteur et le menu se contrediraient. Le menu affiche donc l'effort réel (`Extra high`) et
+`Ultracode` parmi les options. Les crans sont écrits sous le libellé même de Claude Code, pour
+qu'il n'y ait rien à convertir de tête.
 
 L'état se lit ailleurs, et de façon structurée : Claude Code inscrit dans son propre transcript un
 attachment `ultra_effort_enter` à l'armement et `ultra_effort_exit` à la retombée, et relit le
@@ -115,8 +116,34 @@ dernier pour retrouver son état. On applique la même règle. Ce marqueur n'est
 dix prompts et se retrouve souvent à plusieurs mégaoctets de la fin du fichier : on remonte donc une
 fois depuis la fin, borné à 8 Mo, puis on ne relit que ce qui s'ajoute.
 
+Le marqueur de retombée peut manquer : un effort baissé au sélecteur juste après l'armement laisse
+`ultra_effort_enter` en dernier, alors que les tours suivants sont joués en `medium`. Comme
+ultracode pose l'effort à `xhigh`, un tour joué à un autre effort prouve qu'il est retombé : il
+n'est affiché qu'avec un dernier tour en `xhigh`.
+
 Rien de tout cela n'est persisté ailleurs — c'est délibéré, le schéma de réglages de Claude Code
 dit d'ultracode : « Session-scoped […] interactive toggles never persist it ».
+
+## Les autres options d'une session
+
+Aucune n'est écrite comme un réglage dans le transcript ; chacune se lit à sa trace.
+
+- **Contexte 1M** : l'identifiant complet du modèle (`claude-opus-5-5[1m]`) n'est que dans
+  l'attachment `model`, écrit au démarrage et à chaque changement de modèle — souvent à plusieurs
+  mégaoctets de la fin. Il est cherché avec le marqueur d'ultracode, dans la même remontée bornée,
+  et ne compte que s'il désigne le modèle des derniers messages. Un texte cité dans une sortie
+  d'outil est échappé (`\"modelId\"`) et ne peut pas s'y faire passer.
+- **Thinking** : le réglage de l'extension (`thinkingLevel`) est global, appliqué à chaque session à
+  son lancement : il ne dit pas ce qu'une session en cours a reçu. Ce qui le dit, ce sont les blocs
+  `thinking` de ses réponses, présents dans 99 à 100 % des tours quand l'option est active. Le
+  thinking se juge donc sur le dernier tour qui a reçu une réponse, qu'il soit ouvert par un prompt
+  ou par une notification.
+- **Fast** : `usage.speed` vaut `fast` sur les messages servis en mode rapide, `standard` sinon.
+- **Advisor** : `advisorModel` accompagne chaque message quand l'outil advisor est offert au modèle.
+  Claude Code peut l'offrir d'office, avec le modèle même de la session ; il n'est donc affiché que
+  lorsqu'il consulte un autre modèle.
+- **Plan** : le mode d'autorisation (`permissionMode`) accompagne chaque prompt humain, un
+  attachment `plan_mode` est rappelé à chaque tour du mode plan, et `plan_mode_exit` le clôt.
 
 ## Lire du JSONL : `split("\n")`, jamais `splitlines()`
 

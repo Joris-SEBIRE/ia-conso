@@ -107,9 +107,11 @@ réseau :
 - Claude Code : `{sessions}` donne les sessions vivantes et leur état ; le transcript de chaque \
 session donne son titre, son **modèle**, son **effort**, le **contexte** occupé et le nombre \
 d'**agents** encore en vol.
-- Chaque ligne se lit dans le même ordre : titre, modèle (une couleur par famille), effort sous le libellé \
-même du sélecteur (`Extra high`, `Max`… ou `Ultracode` si le sixième cran est armé), puis en gris les agents, le contexte et la durée. En rouge, une session \
-qui attend ta réponse.
+- Chaque ligne se lit dans le même ordre : titre, modèle (une couleur par famille, `1M` pour le \
+contexte d'un million de tokens), effort sous le libellé même du sélecteur (`Low` à `Max`), puis \
+les options actives, plus pâles : `Ultracode`, `Thinking`, `Fast`, `Advisor` suivi de son modèle \
+quand il en consulte un autre, `Plan`. Enfin, en gris, les agents, le contexte et la durée. En \
+rouge, une session qui attend ta réponse.
 - Cursor : la base d'état donne les agents en cours, leur modèle, leur contexte, et ceux qui \
 attendent une approbation.
 
@@ -125,6 +127,9 @@ d'API : l'heure du reset tant qu'il n'est pas passé, puis **à relancer**. Elle
 ce que tu la relances, et au plus un jour après le reset.
 - **✓** une session terminée dans les cinq dernières heures, avec depuis quand — ou « interrompue » si \
 c'est toi qui l'as coupée.
+
+Chaque ligne terminée garde le modèle, l'effort et les options de son dernier tour, lus dans son \
+propre transcript, dans les couleurs des sessions en cours mais en retrait.
 
 ## Sons
 

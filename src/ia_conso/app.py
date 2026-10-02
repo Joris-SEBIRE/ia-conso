@@ -59,6 +59,7 @@ from .cursor import fetch as fetch_cursor
 from .formatting import (
     account_title,
     activity_bits,
+    activity_options,
     finished_bits,
     age_seconds,
     amounts,
@@ -116,8 +117,12 @@ ACTIVITY_TITLE_MAX = 42
 STALE_ALPHA = 0.5
 BAR_ALPHA = 0.85
 ACTIVITY_SEP = "  ·  "
-# L'effort reprend la couleur du modèle, en retrait : il la précise, il ne la concurrence pas.
+# L'effort reprend la couleur du modèle, en retrait : il la précise, il ne la concurrence pas. Les
+# options aussi, un cran plus bas.
 EFFORT_ALPHA = 0.75
+OPTION_ALPHA = 0.6
+# Sur une ligne terminée, les mêmes en retrait — sans descendre sous ce qui se lit en mode clair.
+FINISHED_SETUP_ALPHAS = {"model": 0.7, "effort": 0.55, "option": 0.5}
 
 _LABELS: dict[tuple, object] = {}
 _CHROME: dict[tuple, object] = {}
@@ -264,15 +269,21 @@ def _activity_style(role: str, item) -> tuple:
         return _colour(model_tint(item.model)), NSFontWeightSemibold
     if role == "effort":
         return _colour(model_tint(item.model)).colorWithAlphaComponent_(EFFORT_ALPHA), NSFontWeightMedium
+    if role == "option":
+        return _colour(model_tint(item.model)).colorWithAlphaComponent_(OPTION_ALPHA), NSFontWeightMedium
     return NSColor.secondaryLabelColor(), NSFontWeightMedium
 
 
-def _finished_style(role: str) -> tuple:
+def _finished_style(role: str, item) -> tuple:
     """Une session terminée s'efface derrière celles qui tournent ; une coupée signale quoi faire.
 
     La limite en cause prend le rouge de sa jauge pleine, et « à relancer » la couleur des
-    sessions actives : c'est la seule chose à faire de cette ligne.
+    sessions actives : c'est la seule chose à faire de cette ligne. Le modèle, l'effort et les
+    options gardent la couleur de la famille, en retrait de celles des sessions en cours.
     """
+    if role in FINISHED_SETUP_ALPHAS:
+        tint = _colour(model_tint(item.model))
+        return tint.colorWithAlphaComponent_(FINISHED_SETUP_ALPHAS[role]), NSFontWeightMedium
     if role == "halt":
         return _colour("systemRedColor"), NSFontWeightSemibold
     if role == "relaunch":
@@ -317,7 +328,7 @@ def _append_activity(text, items, finished=()) -> None:
                 text.appendAttributedString_(
                     _run(ACTIVITY_SEP, META_FONT, color=NSColor.tertiaryLabelColor(), weight=NSFontWeightMedium)
                 )
-            colour, weight = _finished_style(role)
+            colour, weight = _finished_style(role, item)
             text.appendAttributedString_(
                 _run(_crop(raw) if role == "title" else raw, META_FONT, color=colour, weight=weight)
             )
@@ -932,6 +943,7 @@ class IAConsoApp(NSObject):
                         "titre": item.title,
                         "modele": item.model,
                         "effort": item.effort,
+                        "options": activity_options(item),
                         "agents": item.agents,
                         "en_attente": item.is_waiting,
                     }

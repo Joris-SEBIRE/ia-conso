@@ -56,9 +56,15 @@ AGENT_HOT_SECONDS = 15 * 60
 # il est souvent loin de la fin : on remonte une fois, borné, puis on ne lit que ce qui s'ajoute.
 ULTRA_ENTER = b'"ultra_effort_enter"'
 ULTRA_EXIT = b'"ultra_effort_exit"'
-ULTRA_SCAN_MAX = 8 << 20
+ULTRA_EFFORT = "xhigh"
+# Même chose pour l'identifiant complet du modèle — `claude-opus-5-5[1m]` pour le contexte 1M —
+# que seul l'attachment `model` porte, écrit au démarrage et à chaque changement de modèle. Un
+# texte cité dans une sortie d'outil est échappé (`\"modelId\"`) et ne peut pas correspondre.
+MODEL_ID = re.compile(rb'"modelId": ?"([^"]+)"')
+LONG_CONTEXT_SUFFIX = "[1m]"
+SCAN_MAX = 8 << 20
 # Un marqueur peut être à cheval sur deux lectures successives.
-ULTRA_OVERLAP = 256
+SCAN_OVERLAP = 256
 
 # Un agent de fond n'a pas de journal qui le clôt : on le tient pour vivant tant que son
 # transcript bouge. Il peut donc disparaître un instant s'il réfléchit longtemps sans écrire.
@@ -69,6 +75,10 @@ SYNTHETIC_MODEL = "<synthetic>"
 # Ce que Claude Code inscrit comme message de l'utilisateur quand il coupe un tour : Échap, ou
 # un outil refusé (« … for tool use »).
 INTERRUPTED_MARK = "[Request interrupted by user"
+# Ce qui ouvre un tour : un prompt de l'utilisateur, ou la notification d'une tâche de fond.
+TURN_ORIGINS = frozenset({"human", "task-notification"})
+# Un tour pensé laisse ces blocs dans la réponse : 99 à 100 % des tours quand thinking est actif.
+THINKING_BLOCKS = frozenset({"thinking", "redacted_thinking"})
 # Un prompt sert de titre de repli : au-delà, il ne tiendrait sur aucune ligne.
 PROMPT_MAX = 120
 # Les transcripts nomment le modèle en clair : on ne garde que ce qui se lit dans un menu.
@@ -76,8 +86,8 @@ MODEL_WORDS = ("opus", "sonnet", "haiku", "fable")
 
 # (mtime → détails) par session : sonder chaque seconde ne doit relire que ce qui a changé.
 _session_cache: dict[str, tuple[float, "SessionDetails"]] = {}
-# session → (octets déjà examinés, ultracode armé ou non)
-_ultra_cache: dict[str, tuple[int, bool | None]] = {}
+# session → (octets déjà examinés, ultracode armé ou non, identifiant complet du modèle)
+_marker_cache: dict[str, tuple[int, bool | None, str]] = {}
 # Une commande lancée en arrière-plan rend la main aussitôt : la session repasse « idle » et
 # attend, parfois plusieurs minutes, la notification qui la réveillera. Ces deux traces du
 # transcript la bornent ; sans elles, une session qui fait tourner une recette paraît éteinte.
@@ -115,10 +125,30 @@ class SessionDetails:
     resets_ms: int = 0
     # Le dernier tour a été coupé par l'utilisateur.
     is_interrupted: bool = False
+    # Les options du dernier tour : thinking, mode rapide, advisor (son modèle), mode plan.
+    is_thinking: bool = False
+    is_fast: bool = False
+    advisor: str = ""
+    is_planning: bool = False
+
+
+@dataclass(frozen=True, kw_only=True)
+class SessionSetup:
+    """Sur quoi tourne une session : son modèle, son effort et ses options, en cours comme terminée."""
+
+    model: str = ""
+    effort: str = ""
+    # Options actives : ultracode, contexte 1M, thinking, mode rapide, advisor (son modèle), mode plan.
+    is_ultra: bool = False
+    has_long_context: bool = False
+    is_thinking: bool = False
+    is_fast: bool = False
+    advisor: str = ""
+    is_planning: bool = False
 
 
 @dataclass(frozen=True)
-class ActivityItem:
+class ActivityItem(SessionSetup):
     """Une session qui travaille. `key` est son identité stable, jamais son titre."""
 
     key: str
@@ -127,9 +157,6 @@ class ActivityItem:
     is_waiting: bool = False
     # Un tour est en cours : la session elle-même travaille, pas seulement ses agents ou ses tâches.
     is_busy: bool = False
-    model: str = ""
-    effort: str = ""
-    is_ultra: bool = False
     agents: int = 0
     # Commandes lancées en arrière-plan, qui travaillent pendant que la session attend.
     background: int = 0
@@ -140,7 +167,7 @@ class ActivityItem:
 
 
 @dataclass(frozen=True)
-class FinishedItem:
+class FinishedItem(SessionSetup):
     """Une session qui ne travaille plus : finie normalement, ou coupée par une erreur d'API."""
 
     key: str
@@ -228,28 +255,26 @@ def _read_at(path: Path, start: int, end: int) -> bytes:
         return b""
 
 
-def _last_ultra(chunk: bytes) -> bool | None:
-    """Le dernier marqueur d'un extrait : armé, retombé, ou aucun des deux."""
+def _last_markers(chunk: bytes) -> tuple[bool | None, str]:
+    """Les derniers marqueurs d'un extrait : ultracode armé, retombé ou inconnu, et l'id du modèle."""
     enter, exit_ = chunk.rfind(ULTRA_ENTER), chunk.rfind(ULTRA_EXIT)
-    if enter < 0 and exit_ < 0:
-        return None
-    return enter > exit_
+    ids = MODEL_ID.findall(chunk)
+    return (None if enter < 0 and exit_ < 0 else enter > exit_), ids[-1].decode(errors="ignore") if ids else ""
 
 
-def _ultra_state(session_id: str, path: Path, size: int) -> bool:
-    """Ultracode est-il armé sur cette session ? Le dernier marqueur du transcript fait foi."""
-    seen, active = _ultra_cache.get(session_id, (0, None))
+def _markers(session_id: str, path: Path, size: int) -> tuple[bool, str]:
+    """Ultracode armé ou non, et l'identifiant complet du modèle : le dernier marqueur fait foi."""
+    seen, ultra, model_id = _marker_cache.get(session_id, (0, None, ""))
     if seen and size >= seen:
         if size > seen:
-            found = _last_ultra(_read_at(path, seen - ULTRA_OVERLAP, size))
-            if found is not None:
-                active = found
-            _ultra_cache[session_id] = (size, active)
-        return bool(active)
+            found, found_id = _last_markers(_read_at(path, seen - SCAN_OVERLAP, size))
+            ultra, model_id = ultra if found is None else found, found_id or model_id
+            _marker_cache[session_id] = (size, ultra, model_id)
+        return bool(ultra), model_id
     # Première lecture, ou fichier réécrit : on remonte depuis la fin, sans dépasser la borne.
-    active = _last_ultra(_read_at(path, size - ULTRA_SCAN_MAX, size))
-    _ultra_cache[session_id] = (size, active)
-    return bool(active)
+    ultra, model_id = _last_markers(_read_at(path, size - SCAN_MAX, size))
+    _marker_cache[session_id] = (size, ultra, model_id)
+    return bool(ultra), model_id
 
 
 def _notice_ids(text: str) -> set[str]:
@@ -309,7 +334,7 @@ def _background_tasks(session_id: str, path: Path, size: int) -> tuple[int, int]
     seen, launched, notified, prompted = _background_cache.get(session_id, (0, {}, set(), 0.0))
     if not seen or size < seen:
         # Première lecture, ou fichier réécrit : on remonte depuis la fin, sans dépasser la borne.
-        seen, launched, notified, prompted = max(0, size - ULTRA_SCAN_MAX), {}, set(), 0.0
+        seen, launched, notified, prompted = max(0, size - SCAN_MAX), {}, set(), 0.0
     if size > seen:
         chunk = _read_at(path, seen, size)
         # Une ligne en cours d'écriture sera relue entière au passage suivant.
@@ -353,9 +378,9 @@ def _read_session(path: Path) -> SessionDetails:
     Une erreur d'API s'inscrit comme un message de l'assistant, au modèle `<synthetic>` et sans
     usage : elle date la fin du tour mais ne dit rien du modèle ni du contexte.
     """
-    custom = ai = model = effort = prompt = halt = limit = ""
+    custom = ai = model = effort = prompt = halt = limit = advisor = mode = ""
     context = ended = resets = 0
-    interrupted = False
+    interrupted = fast = thinking = turn_thinking = turn_answered = False
     for line in _tail(path).split("\n"):
         if "{" not in line:
             continue
@@ -375,6 +400,18 @@ def _read_session(path: Path) -> SessionDetails:
         if kind == "last-prompt":
             prompt = " ".join(str(event.get("lastPrompt") or "").split())[:PROMPT_MAX] or prompt
             continue
+        if kind == "attachment":
+            attachment = event.get("attachment") if isinstance(event.get("attachment"), dict) else {}
+            # Rappelé à chaque tour tant que le mode plan dure, et clos par sa sortie.
+            mode = {"plan_mode": "plan", "plan_mode_exit": "default"}.get(str(attachment.get("type")), mode)
+            continue
+        origin = event.get("origin") if isinstance(event.get("origin"), dict) else {}
+        if kind == "user" and not event.get("isSidechain") and origin.get("kind") in TURN_ORIGINS:
+            # Un nouveau tour : le thinking se juge sur le dernier tour qui a reçu une réponse.
+            thinking = turn_thinking if turn_answered else thinking
+            turn_thinking = turn_answered = False
+            if origin.get("kind") == "human":
+                mode = str(event.get("permissionMode") or "") or mode
         if kind == "user" and not event.get("isSidechain") and INTERRUPTED_MARK in line:
             message = event.get("message") if isinstance(event.get("message"), dict) else {}
             content = message.get("content")
@@ -402,7 +439,14 @@ def _read_session(path: Path) -> SessionDetails:
                 continue
             model = str(message.get("model") or "") or model
             effort = str(event.get("perTurnEffort") or event.get("effort") or "") or effort
+            advisor = str(event.get("advisorModel") or "")
+            content = message.get("content") if isinstance(message.get("content"), list) else []
+            turn_answered = True
+            turn_thinking = turn_thinking or any(
+                isinstance(block, dict) and block.get("type") in THINKING_BLOCKS for block in content
+            )
             usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+            fast = usage.get("speed") == "fast" if usage else fast
             if usage:
                 context = sum(
                     int(usage.get(key) or 0)
@@ -419,6 +463,10 @@ def _read_session(path: Path) -> SessionDetails:
         limit=limit,
         resets_ms=resets,
         is_interrupted=interrupted,
+        is_thinking=turn_thinking if turn_answered else thinking,
+        is_fast=fast,
+        advisor=_model_label(advisor) if advisor else "",
+        is_planning=mode == "plan",
     )
 
 
@@ -512,6 +560,25 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _setup(session_id: str, path: Path | None, size: int, details: SessionDetails) -> dict:
+    """Modèle, effort et options d'une session, tels que ses lignes les portent.
+
+    Ultracode pose l'effort à xhigh : un tour joué à un autre effort prouve qu'il est retombé, même
+    si Claude Code n'a pas encore écrit le marqueur de sortie.
+    """
+    ultra, model_id = _markers(session_id, path, size) if path and size else (False, "")
+    return {
+        "model": details.model,
+        "effort": details.effort,
+        "is_ultra": ultra and details.effort == ULTRA_EFFORT,
+        "has_long_context": model_id.endswith(LONG_CONTEXT_SUFFIX) and _model_label(model_id) == details.model,
+        "is_thinking": details.is_thinking,
+        "is_fast": details.is_fast,
+        "advisor": details.advisor,
+        "is_planning": details.is_planning,
+    }
+
+
 def _claude_sessions() -> tuple[tuple[ActivityItem, ...], frozenset[str]]:
     """Sessions Claude Code vivantes et non idle, une ligne par session, et celles qui ont rendu la main.
 
@@ -581,13 +648,11 @@ def _claude_sessions() -> tuple[tuple[ActivityItem, ...], frozenset[str]]:
             since_ms=_as_ms(blob.get("statusUpdatedAt") or started) or started,
             is_waiting=status in CLAUDE_WAITING,
             is_busy=status not in CLAUDE_IDLE and status not in CLAUDE_WAITING,
-            model=details.model,
-            effort=details.effort,
-            is_ultra=_ultra_state(session_id, transcript, size) if size else False,
             agents=agents,
             background=background,
             is_interrupted=details.is_interrupted,
             context_tokens=details.context_tokens,
+            **_setup(session_id, transcript, size, details),
         )
     # Deux process sur la même session : si l'un travaille, elle n'a pas rendu la main.
     return tuple(items.values()), frozenset(settled - busy)
@@ -633,6 +698,10 @@ def _claude_finished(running: set[str]) -> tuple[FinishedItem, ...]:
             shown_until = details.ended_ms + RECENT_SECONDS * 1000
         if shown_until < now_ms or details.ended_ms <= finished.get(session_id, FinishedItem("", "", 0)).ended_ms:
             continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
         finished[session_id] = FinishedItem(
             key=session_id,
             title=details.title or details.last_prompt or "session",
@@ -641,6 +710,7 @@ def _claude_finished(running: set[str]) -> tuple[FinishedItem, ...]:
             limit=details.limit,
             resets_ms=details.resets_ms,
             is_interrupted=details.is_interrupted,
+            **_setup(session_id, path, size, details),
         )
     return tuple(sorted(finished.values(), key=lambda item: (not item.halt, -item.ended_ms)))
 

@@ -316,7 +316,8 @@ def account_title(name: str, plan: str) -> str:
 
 # Les crans du sélecteur d'effort de Claude Code, écrits comme lui les écrit : c'est ce que
 # l'utilisateur lit dans son interface, et le seul repère qui lui permette de recouper.
-# « Ultracode » en est le sixième : il pose l'effort à xhigh et arme les workflows.
+# « Ultracode » en est le sixième : il pose l'effort à xhigh et arme les workflows. L'effort
+# s'affiche donc tel quel, et Ultracode parmi les options.
 EFFORT_LABELS = {"low": "Low", "medium": "Medium", "high": "High", "xhigh": "Extra high", "max": "Max"}
 ULTRACODE_LABEL = "Ultracode"
 # Une couleur par famille de modèle : reconnaître Opus d'un coup d'œil vaut mieux qu'un mot de plus.
@@ -340,21 +341,40 @@ def model_tint(model: str) -> str:
     return MODEL_TINTS.get(first, "IDENTITY")
 
 
+def activity_options(item) -> list[str]:
+    """Les options actives d'une session, sous les noms que Claude Code leur donne.
+
+    L'advisor n'est cité que s'il consulte un autre modèle que celui de la session : avec le
+    même, il n'apporte rien qu'on ait à savoir.
+    """
+    options = [ULTRACODE_LABEL] if item.is_ultra else []
+    options += [label for flag, label in ((item.is_thinking, "Thinking"), (item.is_fast, "Fast")) if flag]
+    if item.advisor and item.advisor != item.model:
+        options.append(f"Advisor {item.advisor}")
+    return options + (["Plan"] if item.is_planning else [])
+
+
+def setup_bits(item) -> list[tuple[str, str]]:
+    """Le modèle, l'effort et les options d'une session : la même suite, en cours comme terminée."""
+    bits: list[tuple[str, str]] = []
+    if item.model:
+        bits.append(("model", item.model + (" 1M" if item.has_long_context else "")))
+    if label := effort_label(item.effort):
+        bits.append(("effort", label))
+    return bits + [("option", option) for option in activity_options(item)]
+
+
 def activity_bits(item, now_ms: int) -> list[tuple[str, str]]:
     """Les morceaux d'une ligne d'activité, chacun avec son rôle d'affichage.
 
-    L'ordre place en tête ce qui coûte — le modèle, puis l'effort — et laisse en gris ce qui
-    décrit l'avancement. L'état « en cours » n'est pas écrit : il est porté par la couleur.
+    L'ordre place en tête ce qui coûte — le modèle, l'effort, puis les options actives — et
+    laisse en gris ce qui décrit l'avancement. L'état « en cours » n'est pas écrit : il est porté
+    par la couleur.
     """
     bits: list[tuple[str, str]] = [("title", item.title.strip() or "session")]
     if item.is_waiting:
         bits.append(("alert", "en attente de réponse"))
-    if item.model:
-        bits.append(("model", item.model))
-    if getattr(item, "is_ultra", False):
-        bits.append(("effort", ULTRACODE_LABEL))
-    elif label := effort_label(item.effort):
-        bits.append(("effort", label))
+    bits += setup_bits(item)
     if item.agents:
         bits.append(("muted", f"{item.agents} agent" + ("s" if item.agents > 1 else "")))
     if getattr(item, "background", 0):
@@ -395,14 +415,15 @@ def halt_label(item) -> str:
 def finished_bits(item, now_ms: int) -> list[tuple[str, str]]:
     """Les morceaux d'une ligne de session terminée.
 
-    Une fin normale ne dit que depuis quand. Une session coupée dit par quoi, et ce qu'il reste à
-    faire : attendre le reset de la limite, ou la relancer.
+    Une fin normale dit sur quoi la session tournait et depuis quand. Une session coupée dit
+    d'abord par quoi, et finit par ce qu'il reste à faire : attendre le reset de la limite, ou la
+    relancer.
     """
     ended = ago(datetime.fromtimestamp(item.ended_ms / 1000, timezone.utc))
     bits: list[tuple[str, str]] = [("title", item.title.strip() or "session")]
     if not item.halt:
-        return [*bits, ("muted", f"{'interrompue' if item.is_interrupted else 'terminée'} {ended}")]
-    bits += [("halt", halt_label(item)), ("muted", ended)]
+        return [*bits, *setup_bits(item), ("muted", f"{'interrompue' if item.is_interrupted else 'terminée'} {ended}")]
+    bits += [("halt", halt_label(item)), *setup_bits(item), ("muted", ended)]
     if item.resets_ms > now_ms:
         return [*bits, ("muted", f"reset {pinpoint(datetime.fromtimestamp(item.resets_ms / 1000, timezone.utc))}")]
     return [*bits, ("relaunch", "à relancer")]
