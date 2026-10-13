@@ -166,9 +166,11 @@ continuent de tourner et restent comptés.
 en arrière-plan — une recette de plusieurs minutes, par exemple — rend la main aussitôt et passe
 « idle » jusqu'à la notification qui la réveille. Sans autre signal, elle paraît éteinte pendant
 tout ce temps. Le transcript borne ces commandes : un résultat d'outil qui commence par l'accusé de
-lancement (lancée d'emblée en arrière-plan, ou basculée d'office après un délai), puis une
-notification en tête de message. Une commande lancée mais jamais notifiée depuis deux heures ne
-compte plus : la session a pu être tuée entre-temps. Une session « idle » reste donc affichée tant
+lancement (lancée d'emblée en arrière-plan, ou basculée d'office après un délai), puis sa fin : une
+notification en tête de message, ou, quand la session l'arrête elle-même avec `TaskStop`, l'accusé
+d'arrêt (`{"message":"Successfully stopped task: <id> …`) — cet arrêt-là n'est suivi d'aucune
+notification. Une commande lancée mais jamais close depuis deux heures ne compte plus : la session
+a pu être tuée entre-temps. Une session « idle » reste donc affichée tant
 qu'elle a des agents ou des commandes de fond en vol.
 
 Les agents en vol se lisent de deux façons, parce qu'ils ne laissent pas la même trace. Ceux d'un
@@ -217,7 +219,7 @@ aussitôt, et la session attend la notification de fin pour conclure — « je r
 script a fini ». Ce tour-là n'a rien fini. Une commande lancée en fond depuis le dernier prompt
 humain (`origin.kind: "human"`) et pas encore notifiée retient donc le son, et la session sonne au
 tour que sa notification déclenche. Une commande lancée lors d'un tour précédent — un serveur, qui
-ne s'arrête jamais — ne retient pas la réponse au prompt suivant. Une commande jamais notifiée ne
+ne s'arrête jamais — ne retient pas la réponse au prompt suivant. Une commande jamais close ne
 sonne pas non plus en cessant d'être comptée : la session ne sonne qu'après un tour qu'on l'a vue
 travailler. En terminal, Claude Code écrit `shell` pour une session au repos pendant une commande
 de fond : c'est un `idle`.

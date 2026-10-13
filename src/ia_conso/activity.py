@@ -89,22 +89,25 @@ _session_cache: dict[str, tuple[float, "SessionDetails"]] = {}
 # session → (octets déjà examinés, ultracode armé ou non, identifiant complet du modèle)
 _marker_cache: dict[str, tuple[int, bool | None, str]] = {}
 # Une commande lancée en arrière-plan rend la main aussitôt : la session repasse « idle » et
-# attend, parfois plusieurs minutes, la notification qui la réveillera. Ces deux traces du
-# transcript la bornent ; sans elles, une session qui fait tourner une recette paraît éteinte.
+# attend, parfois plusieurs minutes, la notification qui la réveillera. Ces traces du transcript
+# la bornent ; sans elles, une session qui fait tourner une recette paraît éteinte.
 # Deux façons d'y arriver : une commande lancée d'emblée en arrière-plan, ou une commande trop
 # longue que Claude Code y bascule d'office.
 BACKGROUND_LAUNCH = re.compile(
     r"^(?:Command running in background with ID: ?|"
     r"Command did not complete within .{1,40}? moved to the background \(ID: ?)([A-Za-z0-9]+)"
 )
-BACKGROUND_HINTS = ("Command running in background", "moved to the background")
+# Une commande que la session arrête elle-même (`TaskStop`) ne reçoit aucune notification : c'est
+# l'accusé d'arrêt qui la clôt.
+BACKGROUND_STOPPED = re.compile(r'^\{"message":"Successfully stopped task: ?([A-Za-z0-9]+)')
+BACKGROUND_HINTS = ("Command running in background", "moved to the background", "Successfully stopped task")
 BACKGROUND_NOTICE = "<task-notification>"
 BACKGROUND_ID = re.compile(r"<task-id>([^<]+)</task-id>")
 # Un prompt tapé par l'utilisateur, et non une notification que Claude Code lui-même envoie.
 HUMAN_PROMPT = '"origin":{"kind":"human"}'
-# Une commande jamais notifiée (session tuée, notification perdue) ne compte plus au-delà.
+# Une commande jamais close (session tuée, notification perdue) ne compte plus au-delà.
 BACKGROUND_STALE_SECONDS = 2 * 3600
-# session → (octets lus, lancées {id: epoch s}, notifiées, dernier prompt humain en epoch s)
+# session → (octets lus, lancées {id: epoch s}, closes, dernier prompt humain en epoch s)
 _background_cache: dict[str, tuple[int, dict[str, float], set[str], float]] = {}
 _agents_cache: dict[str, tuple[tuple, int]] = {}
 
@@ -281,12 +284,12 @@ def _notice_ids(text: str) -> set[str]:
     return set(BACKGROUND_ID.findall(text)) if text.lstrip().startswith(BACKGROUND_NOTICE) else set()
 
 
-def _scan_background(chunk: bytes, launched: dict[str, float], notified: set[str]) -> float:
-    """Relève les lancements en arrière-plan, leurs notifications de fin, et le dernier prompt humain.
+def _scan_background(chunk: bytes, launched: dict[str, float], closed: set[str]) -> float:
+    """Relève les lancements en arrière-plan, leur fin (notification ou arrêt), et le dernier prompt humain.
 
     On ne retient que les traces laissées par Claude Code lui-même : un résultat d'outil qui
-    commence par l'accusé de lancement, une notification en tête de message, un prompt marqué
-    humain. Une session qui cite ces textes dans ses propres sorties ne fabrique ainsi aucune
+    commence par l'accusé de lancement ou d'arrêt, une notification en tête de message, un prompt
+    marqué humain. Une session qui cite ces textes dans ses propres sorties ne fabrique ainsi aucune
     fausse tâche.
     """
     prompted = 0.0
@@ -304,24 +307,26 @@ def _scan_background(chunk: bytes, launched: dict[str, float], notified: set[str
         if is_prompt and event.get("type") == "user" and origin.get("kind") == "human":
             prompted = _as_ms(event.get("timestamp")) / 1000 or time.time()
         if event.get("type") == "queue-operation":
-            notified |= _notice_ids(str(event.get("content") or ""))
+            closed |= _notice_ids(str(event.get("content") or ""))
             continue
         message = event.get("message") if isinstance(event.get("message"), dict) else {}
         content = message.get("content")
         if isinstance(content, str):
-            notified |= _notice_ids(content)
+            closed |= _notice_ids(content)
             continue
         for block in content if isinstance(content, list) else []:
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "text":
-                notified |= _notice_ids(str(block.get("text") or ""))
+                closed |= _notice_ids(str(block.get("text") or ""))
             elif block.get("type") == "tool_result":
                 text = block.get("content")
                 if isinstance(text, list):
                     text = " ".join(str(part.get("text") or "") for part in text if isinstance(part, dict))
                 if match := BACKGROUND_LAUNCH.match(str(text or "")):
                     launched[match.group(1)] = _as_ms(event.get("timestamp")) / 1000 or time.time()
+                elif match := BACKGROUND_STOPPED.match(str(text or "")):
+                    closed.add(match.group(1))
     return prompted
 
 
@@ -331,20 +336,20 @@ def _background_tasks(session_id: str, path: Path, size: int) -> tuple[int, int]
     La seconde valeur compte celles que la session attend pour conclure ce tour-ci. Un serveur lancé lors
     d'un tour précédent tourne toujours, mais la réponse au prompt suivant n'en dépend pas.
     """
-    seen, launched, notified, prompted = _background_cache.get(session_id, (0, {}, set(), 0.0))
+    seen, launched, closed, prompted = _background_cache.get(session_id, (0, {}, set(), 0.0))
     if not seen or size < seen:
         # Première lecture, ou fichier réécrit : on remonte depuis la fin, sans dépasser la borne.
-        seen, launched, notified, prompted = max(0, size - SCAN_MAX), {}, set(), 0.0
+        seen, launched, closed, prompted = max(0, size - SCAN_MAX), {}, set(), 0.0
     if size > seen:
         chunk = _read_at(path, seen, size)
         # Une ligne en cours d'écriture sera relue entière au passage suivant.
         cut = chunk.rfind(b"\n")
         if cut >= 0:
-            prompted = _scan_background(chunk[: cut + 1], launched, notified) or prompted
+            prompted = _scan_background(chunk[: cut + 1], launched, closed) or prompted
             seen += cut + 1
-    _background_cache[session_id] = (seen, launched, notified, prompted)
+    _background_cache[session_id] = (seen, launched, closed, prompted)
     horizon = time.time() - BACKGROUND_STALE_SECONDS
-    running = [at for task, at in launched.items() if task not in notified and at >= horizon]
+    running = [at for task, at in launched.items() if task not in closed and at >= horizon]
     return len(running), sum(1 for at in running if at >= prompted)
 
 
