@@ -100,15 +100,25 @@ BACKGROUND_LAUNCH = re.compile(
 # Une commande que la session arrête elle-même (`TaskStop`) ne reçoit aucune notification : c'est
 # l'accusé d'arrêt qui la clôt.
 BACKGROUND_STOPPED = re.compile(r'^\{"message":"Successfully stopped task: ?([A-Za-z0-9]+)')
-BACKGROUND_HINTS = ("Command running in background", "moved to the background", "Successfully stopped task")
+# Un workflow se lance de la même façon, et son accusé dit dans quel dossier il tient son journal :
+# c'est le seul lien entre la tâche qu'on arrête et les agents que le journal laisse ouverts.
+WORKFLOW_LAUNCH = re.compile(r"^Workflow launched in background\. Task ID: ?([A-Za-z0-9]+)")
+WORKFLOW_RUN = re.compile(r"/workflows/(wf_[A-Za-z0-9_-]+)")
+BACKGROUND_HINTS = (
+    "Command running in background",
+    "moved to the background",
+    "Successfully stopped task",
+    "Workflow launched in background",
+)
 BACKGROUND_NOTICE = "<task-notification>"
 BACKGROUND_ID = re.compile(r"<task-id>([^<]+)</task-id>")
 # Un prompt tapé par l'utilisateur, et non une notification que Claude Code lui-même envoie.
 HUMAN_PROMPT = '"origin":{"kind":"human"}'
 # Une commande jamais close (session tuée, notification perdue) ne compte plus au-delà.
 BACKGROUND_STALE_SECONDS = 2 * 3600
-# session → (octets lus, lancées {id: epoch s}, closes, dernier prompt humain en epoch s)
-_background_cache: dict[str, tuple[int, dict[str, float], set[str], float]] = {}
+# session → (octets lus, lancées {id: epoch s}, closes, dernier prompt humain en epoch s,
+# workflows {id de tâche: dossier du run})
+_background_cache: dict[str, tuple[int, dict[str, float], set[str], float, dict[str, str]]] = {}
 _agents_cache: dict[str, tuple[tuple, int]] = {}
 
 
@@ -284,7 +294,7 @@ def _notice_ids(text: str) -> set[str]:
     return set(BACKGROUND_ID.findall(text)) if text.lstrip().startswith(BACKGROUND_NOTICE) else set()
 
 
-def _scan_background(chunk: bytes, launched: dict[str, float], closed: set[str]) -> float:
+def _scan_background(chunk: bytes, launched: dict[str, float], closed: set[str], runs: dict[str, str]) -> float:
     """Relève les lancements en arrière-plan, leur fin (notification ou arrêt), et le dernier prompt humain.
 
     On ne retient que les traces laissées par Claude Code lui-même : un résultat d'outil qui
@@ -327,30 +337,34 @@ def _scan_background(chunk: bytes, launched: dict[str, float], closed: set[str])
                     launched[match.group(1)] = _as_ms(event.get("timestamp")) / 1000 or time.time()
                 elif match := BACKGROUND_STOPPED.match(str(text or "")):
                     closed.add(match.group(1))
+                elif (match := WORKFLOW_LAUNCH.match(str(text or ""))) and (run := WORKFLOW_RUN.search(str(text))):
+                    runs[match.group(1)] = run.group(1)
     return prompted
 
 
-def _background_tasks(session_id: str, path: Path, size: int) -> tuple[int, int]:
-    """Commandes en arrière-plan encore en cours : toutes, puis celles lancées depuis le dernier prompt.
+def _background_tasks(session_id: str, path: Path, size: int) -> tuple[int, int, frozenset[str]]:
+    """Commandes en arrière-plan encore en cours, celles lancées depuis le dernier prompt, workflows clos.
 
-    La seconde valeur compte celles que la session attend pour conclure ce tour-ci. Un serveur lancé lors
-    d'un tour précédent tourne toujours, mais la réponse au prompt suivant n'en dépend pas.
+    La deuxième valeur compte celles que la session attend pour conclure ce tour-ci. Un serveur lancé
+    lors d'un tour précédent tourne toujours, mais la réponse au prompt suivant n'en dépend pas. La
+    troisième nomme les dossiers des workflows notifiés ou arrêtés : leur journal ne le dit pas.
     """
-    seen, launched, closed, prompted = _background_cache.get(session_id, (0, {}, set(), 0.0))
+    seen, launched, closed, prompted, runs = _background_cache.get(session_id, (0, {}, set(), 0.0, {}))
     if not seen or size < seen:
         # Première lecture, ou fichier réécrit : on remonte depuis la fin, sans dépasser la borne.
-        seen, launched, closed, prompted = max(0, size - SCAN_MAX), {}, set(), 0.0
+        seen, launched, closed, prompted, runs = max(0, size - SCAN_MAX), {}, set(), 0.0, {}
     if size > seen:
         chunk = _read_at(path, seen, size)
         # Une ligne en cours d'écriture sera relue entière au passage suivant.
         cut = chunk.rfind(b"\n")
         if cut >= 0:
-            prompted = _scan_background(chunk[: cut + 1], launched, closed) or prompted
+            prompted = _scan_background(chunk[: cut + 1], launched, closed, runs) or prompted
             seen += cut + 1
-    _background_cache[session_id] = (seen, launched, closed, prompted)
+    _background_cache[session_id] = (seen, launched, closed, prompted, runs)
     horizon = time.time() - BACKGROUND_STALE_SECONDS
     running = [at for task, at in launched.items() if task not in closed and at >= horizon]
-    return len(running), sum(1 for at in running if at >= prompted)
+    finished_runs = frozenset(run for task, run in runs.items() if task in closed)
+    return len(running), sum(1 for at in running if at >= prompted), finished_runs
 
 
 def _model_label(name: str) -> str:
@@ -493,7 +507,7 @@ def _session_details(session_id: str, path: Path | None, mtime: float | None = N
     return details
 
 
-def _workflow_agents(session_id: str) -> int:
+def _workflow_agents(session_id: str, finished_runs: frozenset[str] = frozenset()) -> int:
     """Agents d'un workflow encore en vol : `started` sans `result` ni `failed` dans le journal."""
     if not session_id:
         return 0
@@ -503,8 +517,8 @@ def _workflow_agents(session_id: str) -> int:
             path
             for path in CLAUDE_PROJECTS.glob(f"*/{session_id}/subagents/workflows/*/journal.jsonl")
             # Un workflow interrompu laisse ses agents « démarrés » pour toujours : seul un
-            # journal qui vit encore décrit des agents réellement en vol.
-            if path.stat().st_mtime >= hot
+            # journal qui vit encore, d'un workflow ni arrêté ni notifié, décrit des agents en vol.
+            if path.parent.name not in finished_runs and path.stat().st_mtime >= hot
         )
     except OSError:
         return 0
@@ -622,13 +636,15 @@ def _claude_sessions() -> tuple[tuple[ActivityItem, ...], frozenset[str]]:
             status = "idle"
         session_id = str(blob.get("sessionId") or "").strip()
         cwd = str(blob.get("cwd") or "").strip()
-        agents = _workflow_agents(session_id) + _loose_agents(session_id)
         transcript = _transcript(session_id, cwd)
         try:
             size = transcript.stat().st_size if transcript else 0
         except OSError:
             size = 0
-        background, pending = _background_tasks(session_id, transcript, size) if size else (0, 0)
+        background, pending, finished_runs = (
+            _background_tasks(session_id, transcript, size) if size else (0, 0, frozenset())
+        )
+        agents = _workflow_agents(session_id, finished_runs) + _loose_agents(session_id)
         key = session_id or f"pid:{pid}"
         # Claude Code garde la session « busy » tant que ses agents ou son workflow tournent : son
         # « idle » est la vraie fin du tour, que les agents comptés ici soient retombés ou non. Il

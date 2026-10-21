@@ -176,7 +176,11 @@ qu'elle a des agents ou des commandes de fond en vol.
 Les agents en vol se lisent de deux façons, parce qu'ils ne laissent pas la même trace. Ceux d'un
 workflow ont un journal qui les ouvre et les ferme (`started` sans `result` ni `failed`), à
 condition de n'ouvrir que les journaux encore chauds : un workflow interrompu laisse ses agents
-« démarrés » pour toujours. Ceux lancés hors workflow, eux, ne sont fermés par rien — l'outil rend
+« démarrés » pour toujours. Un workflow arrêté par la session (`TaskStop`) n'écrit rien non plus
+dans son journal : son arrêt n'est que dans le transcript de la session. L'accusé de lancement
+(`Workflow launched in background. Task ID: <id>`) donne le dossier de son journal
+(`…/workflows/wf_…`), et l'accusé d'arrêt ou la notification de fin de cette tâche clôt tous ses
+agents d'un coup. Ceux lancés hors workflow, eux, ne sont fermés par rien — l'outil rend
 son résultat dès le lancement, longtemps avant la fin du travail — et se comptent donc par
 l'activité de leur propre transcript.
 
