@@ -8,6 +8,8 @@ vue dessine elle-même sa pastille de survol, son éclair de clic et ses libell�
 
 from __future__ import annotations
 
+import math
+
 import objc
 from Cocoa import (
     NSAppearanceNameDarkAqua,
@@ -45,7 +47,7 @@ GLYPH_SIZE = 11.0
 INSET = 6.0
 GLYPH = 15.0
 # Écart entre l'icône et son libellé, et respiration à droite avant la zone suivante. Serrés :
-# la ligne se partage en parts égales, et chaque point gagné est un caractère de plus.
+# quand la ligne manque de place, chaque point gagné est un caractère de plus.
 GAP = 5.0
 TAIL = 6.0
 LABEL_SIZE = 11.0
@@ -97,6 +99,25 @@ def _glyph(name: str, tint):
     return _GLYPHS[key]
 
 
+def spans(needs: list[float], room: float) -> list[float]:
+    """Largeur de chaque zone, d'après la place qu'il faut à chacune pour son icône et son libellé.
+
+    Tout tient : chacune a sa place, et le reste se partage à parts égales, ce qui laisse le même
+    espace entre deux libellés. Sinon, une zone au libellé court n'a que sa place, et les autres se
+    partagent à égalité ce qui reste : un libellé n'est coupé que faute de place, et tous ceux qui
+    le sont gardent la même largeur.
+    """
+    if sum(needs) <= room:
+        extra = (room - sum(needs)) / max(1, len(needs))
+        return [need + extra for need in needs]
+    left, count = room, len(needs)
+    for need in sorted(needs):
+        if need > left / count:
+            break
+        left, count = left - need, count - 1
+    return [min(need, left / count) for need in needs]
+
+
 def _style():
     style = NSMutableParagraphStyle.alloc().init()
     style.setLineBreakMode_(NSLineBreakByTruncatingTail)
@@ -111,6 +132,8 @@ class Shortcuts(NSView):
         if self is None:
             return None
         self.entries = []
+        # Bords des zones, recalculés quand la largeur ou les libellés changent.
+        self.layout_key, self.edges = None, []
         self.zone = None
         self.flashing = None
         self.on_pick = None
@@ -124,9 +147,21 @@ class Shortcuts(NSView):
 
     @objc.python_method
     def slot(self, index: int):
-        """Rectangle d'une zone : la ligne se partage en parts égales, bords compris."""
-        span = (self.bounds().size.width - 2 * INSET) / max(1, len(self.entries))
-        return NSMakeRect(INSET + index * span, 0.0, span, self.bounds().size.height)
+        """Rectangle d'une zone : sa part de la ligne, selon `spans`, bords compris."""
+        width = self.bounds().size.width
+        key = (width, tuple(entry[1] for entry in self.entries))
+        if key != self.layout_key:
+            font = NSFont.systemFontOfSize_weight_(LABEL_SIZE, NSFontWeightMedium)
+            needs = [
+                GAP + GLYPH + GAP + TAIL
+                + math.ceil(NSAttributedString.alloc().initWithString_attributes_(label, {NSFontAttributeName: font}).size().width)
+                for _, label, *_ in self.entries
+            ]
+            self.layout_key, self.edges = key, [INSET]
+            for span in spans(needs, width - 2 * INSET):
+                self.edges.append(self.edges[-1] + span)
+        left, right = self.edges[index], self.edges[index + 1]
+        return NSMakeRect(left, 0.0, right - left, self.bounds().size.height)
 
     @objc.python_method
     def hovered(self):
