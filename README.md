@@ -114,9 +114,9 @@ si c'est toi qui l'as coupée. Chacune garde le modèle, l'effort et les options
 lus dans son propre transcript, en retrait. Une session coupée reste listée jusqu'à sa relance, et
 au plus un jour après le reset. Aucune n'entre dans les pastilles.
 
-**Sons** : une clochette (`Glass`) quand une session finit son tour — sa réponse est prête — et un
-autre son (`Submarine`) quand une session attend ton intervention (permission, question, plan à
-valider) ou qu'une limite vient de la couper. Une session qui a lancé des agents, ou une commande
+**Sons** : deux notes de marimba quand une session finit son tour — sa réponse est prête — et deux
+gouttes d'eau quand une session attend ton intervention (permission, question, plan à valider) ou
+qu'une limite vient de la couper. Une session qui a lancé des agents, ou une commande
 de fond pour ce tour, ne sonne qu'une fois, à la fin ; un tour que tu as coupé ne sonne pas.
 L'entrée **Sons** du menu les coupe.
 
@@ -145,8 +145,9 @@ n'a plus cours.
 
 - `refresh_seconds` : le cycle de lecture de la conso (60 s par défaut) ;
 - `sounds` : les sons, activés par défaut — c'est aussi ce que bascule l'entrée **Sons** du menu ;
-- `sound_finished` et `sound_attention` : le nom d'un son système (`/System/Library/Sounds`), un
-  nom vide coupant ce son-là.
+- `sound_finished` et `sound_attention` : `marimba` et `gouttes` par défaut, les sons livrés avec
+  l'app (`src/ia_conso/*.wav`, fabriqués par `scripts/sons.py`), ou le nom d'un son système
+  (`/System/Library/Sounds`), un nom vide coupant ce son-là.
 
 L'app réécrit le fichier s'il manque une clé. Après un échec, elle attend au moins 30 s — et le délai demandé par
 Anthropic en cas de 429 — avant de retenter.

@@ -7,6 +7,7 @@ import threading
 import time
 import traceback
 from dataclasses import replace
+from pathlib import Path
 
 import objc
 from Cocoa import (
@@ -601,6 +602,14 @@ class IAConsoApp(NSObject):
         self.snapshot = Snapshot()
         self.activity = Activity()
         self.bell = Bell()
+        # Les sons livrés avec l'app, enregistrés sous leur nom : `NSSound.soundNamed_` les trouve
+        # avant les sons système, et un nom de réglage peut désigner les uns comme les autres.
+        self.bundled = [
+            sound
+            for path in Path(__file__).parent.glob("*.wav")
+            if (sound := NSSound.alloc().initWithContentsOfFile_byReference_(str(path), True)) is not None
+            and sound.setName_(path.stem)
+        ]
         self.activity_rows = []
         self.activity_stop = threading.Event()
         self.avatars = Avatars()

@@ -34,10 +34,11 @@ class Config:
     # Une minute laisse le pourcentage suivre sans bombarder.
     refresh_seconds: int = 60
     # Un son quand une session finit son tour, un autre quand elle attend ton intervention. Les
-    # noms sont ceux des sons système (/System/Library/Sounds) ; un nom vide coupe ce son-là.
+    # noms sont ceux des sons livrés (marimba, gouttes, fabriqués par scripts/sons.py) ou des sons
+    # système (/System/Library/Sounds) ; un nom vide coupe ce son-là.
     sounds: bool = True
-    sound_finished: str = "Glass"
-    sound_attention: str = "Submarine"
+    sound_finished: str = "marimba"
+    sound_attention: str = "gouttes"
 
     @classmethod
     def load(cls) -> "Config":

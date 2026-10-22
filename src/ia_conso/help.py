@@ -135,15 +135,15 @@ propre transcript, dans les couleurs des sessions en cours mais en retrait.
 
 Deux sons, pour ne pas avoir à surveiller le menu :
 
-- **Glass** quand une session finit son tour : sa réponse est prête à lire. Une session qui a lancé \
-des agents, ou une commande de fond pour ce tour, ne sonne qu'une fois, quand ils ont fini et \
-qu'elle a conclu. Pas de son si c'est toi qui as coupé le tour.
-- **Submarine** quand une session attend ton intervention — une permission, une question, un plan \
-à valider — ou qu'une limite vient de la couper.
+- deux notes de **marimba** quand une session finit son tour : sa réponse est prête à lire. Une \
+session qui a lancé des agents, ou une commande de fond pour ce tour, ne sonne qu'une fois, quand \
+ils ont fini et qu'elle a conclu. Pas de son si c'est toi qui as coupé le tour.
+- deux **gouttes** d'eau quand une session attend ton intervention — une permission, une \
+question, un plan à valider — ou qu'une limite vient de la couper.
 
 L'entrée **Sons** du menu les coupe ou les rétablit. Dans `{config}`, `sound_finished` et \
-`sound_attention` prennent le nom d'un autre son système (`Ping`, `Hero`, `Funk`…) ; un nom vide \
-coupe ce son-là.
+`sound_attention` valent `marimba` et `gouttes`, les sons livrés avec l'app, ou le nom d'un son \
+système (`Glass`, `Ping`, `Submarine`…) ; un nom vide coupe ce son-là.
 
 ## Réglages
 
