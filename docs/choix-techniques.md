@@ -85,6 +85,10 @@ chiffre faux, teinté comme une alerte. Elle ressort donc à zéro, datée de so
 valeur encore certaine, avec « conso inconnue depuis ». La barre des menus, elle, n'a pas la place
 de dater un zéro : elle montre « — » plutôt qu'un zéro qui passerait pour une lecture.
 
+La règle vaut aussi pour les chiffres gardés en mémoire : une échéance qui passe entre deux
+lectures, ou pendant un cycle raté ou bloqué, réarme la fenêtre au tick suivant. La répartition de
+la semaine tombe avec la semaine : elle décrit celle qui vient de se clore.
+
 ## L'activité se lit par la queue des fichiers
 
 Les transcripts montent à la centaine de mégaoctets et la base d'état de Cursor à plusieurs

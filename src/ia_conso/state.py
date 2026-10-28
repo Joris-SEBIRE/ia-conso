@@ -85,25 +85,41 @@ def _window_blob(window: Window | None) -> dict | None:
     }
 
 
-def _window_from(blob, at: datetime | None = None) -> Window | None:
-    """Une fenêtre mémorisée dont l'échéance est passée s'est réarmée : sa valeur est périmée."""
+def rearm(window: Window | None) -> Window | None:
+    """Une fenêtre dont l'échéance est passée s'est réarmée : sa valeur est périmée."""
+    if window is None or window.resets_at is None or window.resets_at > now():
+        return window
+    # Le pourcentage lu avant le réarmement est faux ; zéro, à cette date, est certain.
+    return Window(
+        label=window.label,
+        percent=0.0,
+        resets_at=None,
+        is_session=window.is_session,
+        currency=window.currency,
+        rearmed_at=window.resets_at,
+    )
+
+
+def rearm_view(view: AccountView) -> AccountView:
+    """La vue telle qu'elle vaut maintenant, qu'elle sorte du cache ou d'une lecture d'avant le reset."""
+    weekly = rearm(view.weekly)
+    return replace(
+        view,
+        session=rearm(view.session),
+        weekly=weekly,
+        scoped=tuple(rearm(window) for window in view.scoped),
+        # La répartition décrit la semaine close : elle tombe avec elle.
+        breakdown=() if weekly and weekly.rearmed_at else view.breakdown,
+    )
+
+
+def _window_from(blob) -> Window | None:
     if not isinstance(blob, dict) or blob.get("percent") is None:
         return None
-    resets_at = parse_ts(blob.get("resets_at"))
-    if resets_at is not None and resets_at <= (at or now()):
-        # Le pourcentage lu avant le réarmement est faux ; zéro, à cette date, est certain.
-        return Window(
-            label=str(blob.get("label") or ""),
-            percent=0.0,
-            resets_at=None,
-            is_session=bool(blob.get("is_session")),
-            currency=str(blob.get("currency") or ""),
-            rearmed_at=resets_at,
-        )
     return Window(
         label=str(blob.get("label") or ""),
         percent=float(blob["percent"]),
-        resets_at=resets_at,
+        resets_at=parse_ts(blob.get("resets_at")),
         is_session=bool(blob.get("is_session")),
         used=blob.get("used"),
         cap=blob.get("cap"),
@@ -219,7 +235,7 @@ def cached_account_view(key: str, name: str, plan: str, email: str, is_active: b
         for label, share in (store.get("breakdown") or [])
         if label is not None and share is not None
     )
-    return AccountView(
+    view = AccountView(
         key=key,
         provider=CLAUDE,
         # « org_name » est le nom d'avant la refonte du cache : les fichiers existants le portent.
@@ -235,6 +251,7 @@ def cached_account_view(key: str, name: str, plan: str, email: str, is_active: b
         breakdown=breakdown,
         fetched_at=parse_ts(store.get("fetched_at")),
     )
+    return rearm_view(view)
 
 
 def state_paths() -> tuple:

@@ -77,7 +77,7 @@ from .formatting import (
 )
 from .models import CLAUDE, CURSOR, AccountView, Extra, Snapshot, Window, now
 from .paths import CONFIG_PATH
-from .state import acquire_single_instance, log_error, write_status
+from .state import acquire_single_instance, log_error, rearm_view, write_status
 
 BUNDLE_ID = "fr.jsebire.ia-conso"
 # Tick UI + sondage local. 0,5 s : on remarque la fin d'un run dès que Cursor écrit sa DB.
@@ -680,6 +680,11 @@ class IAConsoApp(NSObject):
             # Sans redater la tentative, le compte à rebours reste à zéro et un cycle repart aussitôt.
             self.snapshot = replace(self.snapshot, attempted_at=now(), error="cycle interrompu")
             self.stop_spinner()
+        # Une échéance qui passe entre deux lectures réarme sa fenêtre aussitôt, comme dans le cache :
+        # sinon une vue gardée d'un cycle raté ou bloqué affiche son chiffre d'avant le reset.
+        if (views := tuple(rearm_view(view) for view in self.snapshot.views)) != self.snapshot.views:
+            self.snapshot = replace(self.snapshot, views=views)
+            self.render()
         if self.menu_open:
             if self.contents() != self.shown:
                 self.build_menu(self.menu)
