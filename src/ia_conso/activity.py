@@ -67,7 +67,8 @@ SCAN_MAX = 8 << 20
 SCAN_OVERLAP = 256
 
 # Un agent de fond n'a pas de journal qui le clôt : on le tient pour vivant tant que son
-# transcript bouge. Il peut donc disparaître un instant s'il réfléchit longtemps sans écrire.
+# transcript bouge, sauf si son `.meta.json` le dit fini. Il peut donc disparaître un instant
+# s'il réfléchit longtemps sans écrire.
 AGENT_IDLE_SECONDS = 120
 AGENT_CLOSED = frozenset({"result", "failed", "skipped", "cancelled"})
 # Le modèle des messages que Claude Code écrit lui-même : erreurs d'API, « No response requested. ».
@@ -557,7 +558,11 @@ def _workflow_agents(session_id: str, finished_runs: frozenset[str] = frozenset(
 
 
 def _loose_agents(session_id: str) -> int:
-    """Agents lancés hors workflow : leur transcript est le seul signe qu'ils travaillent encore."""
+    """Agents lancés hors workflow : leur transcript qui bouge dit qu'ils travaillent encore.
+
+    Claude Code écrit `finished` dans le `.meta.json` de l'agent quand il le termine : sans ce
+    drapeau, un agent fini restait compté deux minutes, et sa session en cours après sa fin.
+    """
     if not session_id:
         return 0
     hot = time.time() - AGENT_IDLE_SECONDS
@@ -565,10 +570,17 @@ def _loose_agents(session_id: str) -> int:
         return sum(
             1
             for path in CLAUDE_PROJECTS.glob(f"*/{session_id}/subagents/agent-*.jsonl")
-            if path.stat().st_mtime >= hot
+            if path.stat().st_mtime >= hot and not _agent_finished(path)
         )
     except OSError:
         return 0
+
+
+def _agent_finished(transcript: Path) -> bool:
+    try:
+        return json.loads(transcript.with_suffix(".meta.json").read_text() or "{}").get("finished") is True
+    except (OSError, json.JSONDecodeError, UnicodeError, AttributeError):
+        return False
 
 
 def _pid_alive(pid: int) -> bool:
